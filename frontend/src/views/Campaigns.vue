@@ -302,7 +302,7 @@ import CampaignPreview from '../components/CampaignPreview.vue';
 import CopyText from '../components/CopyText.vue';
 import EmptyPlaceholder from '../components/EmptyPlaceholder.vue';
 
-const CAMPAIGNS_REFRESH_INTERVAL = 30000;
+const CAMPAIGNS_REFRESH_INTERVAL = 120000;
 
 export default Vue.extend({
   components: {
@@ -478,7 +478,7 @@ export default Vue.extend({
     // values.
     getCampaignStats(c) {
       if (c.id in this.campaignStatsData) {
-        return this.campaignStatsData[c.id];
+        return { ...c, ...this.campaignStatsData[c.id] };
       }
       return c;
     },

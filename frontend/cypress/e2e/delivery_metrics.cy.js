@@ -116,7 +116,7 @@ describe('Campaign delivery metrics', () => {
     cy.get('.menu a[data-cy="all-campaigns"]').click({ force: true });
 
     cy.wait('@campaignList');
-    cy.tick(30000);
+    cy.tick(120000);
     cy.wait('@campaignList');
 
     let hidden = false;
@@ -125,7 +125,7 @@ describe('Campaign delivery metrics', () => {
       hidden = true;
       doc.dispatchEvent(new Event('visibilitychange'));
     });
-    cy.tick(60000);
+    cy.tick(240000);
     cy.get('@campaignList.all').should('have.length', 2);
 
     cy.document().then((doc) => {
@@ -133,12 +133,12 @@ describe('Campaign delivery metrics', () => {
       doc.dispatchEvent(new Event('visibilitychange'));
     });
     cy.wait('@campaignList');
-    cy.tick(30000);
+    cy.tick(120000);
     cy.wait('@campaignList');
 
     // Destroying Campaigns.vue must stop future listing refreshes.
     cy.get('.menu a').first().click();
-    cy.tick(60000);
+    cy.tick(240000);
     cy.get('@campaignList.all').should('have.length', 4);
   });
 });
