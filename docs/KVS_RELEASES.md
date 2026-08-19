@@ -231,19 +231,31 @@ Rules:
 1. Confirm every intended PR is merged into `kvs-main`.
 2. Confirm `KVSocial CI` is green on the latest `kvs-main` commit.
 3. Fetch the exact remote commit and tags.
-4. Create an annotated tag on that commit.
-5. Push only the tag.
+4. Set `RELEASE_TAG` to the next unused immutable KVSocial revision and verify
+   that it does not already exist remotely.
+5. Create an annotated tag on the fetched `kvs-main` commit.
+6. Push only the tag.
 
 ```sh
 git fetch origin kvs-main --tags
 
 git rev-parse origin/kvs-main
 
-git tag -a v6.2.0-kvs.1 origin/kvs-main \
-  -m "KVSocial Listmonk v6.2.0-kvs.1"
+RELEASE_TAG="v6.2.0-kvs.2"
 
-git push origin v6.2.0-kvs.1
+if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+  echo "Release tag already exists: ${RELEASE_TAG}" >&2
+  exit 1
+fi
+
+git tag -a "$RELEASE_TAG" origin/kvs-main \
+  -m "KVSocial Listmonk ${RELEASE_TAG}"
+
+git push origin "$RELEASE_TAG"
 ```
+
+The value above is an example candidate. Recheck the remote tags at release
+time and increment the KVSocial revision if it has already been used.
 
 The `KVSocial GHCR release` workflow then:
 
@@ -256,7 +268,7 @@ The `KVSocial GHCR release` workflow then:
 Expected images:
 
 ```text
-ghcr.io/kvsocial/listmonk:v6.2.0-kvs.1
+ghcr.io/kvsocial/listmonk:<release-tag>
 ghcr.io/kvsocial/listmonk:kvs-latest
 ```
 
@@ -322,15 +334,24 @@ docker compose --env-file .env -f compose.yml exec -T db sh -lc \
 
 Confirm the backup is present and non-empty before continuing.
 
-### 2. Pin the new image
+### 2. Pin the verified new image
 
-In `compose.yml`, use the immutable image:
+In `compose.yml`, replace `<release-tag>` with the exact tag that completed the
+`KVSocial GHCR release` workflow successfully:
 
 ```yaml
-image: ghcr.io/kvsocial/listmonk:v6.2.0-kvs.1
+image: ghcr.io/kvsocial/listmonk:<release-tag>
 ```
 
-Do not deploy `kvs-latest` in production.
+Confirm the resolved Compose configuration shows that exact immutable tag before
+pulling it:
+
+```sh
+docker compose --env-file .env -f compose.yml config --images
+```
+
+Do not deploy `kvs-latest`, reuse an existing tag, or leave the placeholder in
+production.
 
 ### 3. Pull and restart only Listmonk
 
@@ -360,20 +381,33 @@ Also confirm:
 - SMTP test delivery succeeds;
 - no migration, database, or template errors appear in logs.
 
-## Controlled SendGrid bounce validation
+## Controlled SendGrid delivery lifecycle validation
 
-For the automatic campaign-attribution feature:
+For delivery-event and automatic campaign-attribution changes:
 
-1. Do not add a manual `X-SMTPAPI` campaign header.
-2. Create a one-subscriber private test list.
-3. Use a controlled address that produces a real hard bounce.
-4. Send one campaign to that list.
-5. Confirm SendGrid reports a hard bounce.
-6. Confirm Nginx receives `POST /webhooks/service/sendgrid` with HTTP 200.
-7. Confirm Listmonk records a hard bounce with a non-empty `campaign_id`.
-8. Confirm the campaign's bounce count increments.
-9. Confirm the subscriber is blocklisted according to the configured hard-bounce
-   policy.
+1. Before deployment, confirm there are no running or paused campaigns and take
+   the PostgreSQL backup required above.
+2. Keep only `Bounced` enabled on the existing signed SendGrid webhook while the
+   new image and `v6.2.1-kvs.1` migration are deployed.
+3. Confirm the app is healthy and the migration created
+   `campaign_delivery_events` before changing SendGrid.
+4. Enable `Processed`, `Dropped`, `Deferred`, `Bounced`, and `Delivered` on the
+   same signed endpoint. Do not enable SendGrid engagement events.
+5. Run SendGrid's Test Integration and confirm
+   `POST /webhooks/service/sendgrid` returns HTTP 200. Sample events without
+   Listmonk correlation metadata are expected to be ignored.
+6. Do not add a manual `X-SMTPAPI` header. Create a one-subscriber private test
+   list and send to a controlled valid inbox.
+7. Confirm lifecycle rows contain non-empty campaign and subscriber IDs, a
+   unique provider event ID, and a `delivered` event.
+8. Confirm the campaign listing reports Delivered, Unique Views, Unique Clicks,
+   and their expected rates.
+9. Repeat with a controlled address that produces a real hard bounce. Confirm
+   the bounce is attributed, counted once, and applies the configured subscriber
+   blocklist policy.
+10. Replay a captured signed test payload in a safe environment and confirm the
+    unique provider event ID prevents duplicate lifecycle rows and bounce side
+    effects.
 
 Database verification:
 
@@ -389,10 +423,35 @@ FROM bounces b
 LEFT JOIN subscribers s ON s.id = b.subscriber_id
 ORDER BY b.id DESC
 LIMIT 10;
+
+SELECT
+    e.id,
+    e.campaign_id,
+    e.subscriber_id,
+    e.provider,
+    e.provider_event_id,
+    e.provider_message_id,
+    e.event_type,
+    e.occurred_at
+FROM campaign_delivery_events e
+ORDER BY e.id DESC
+LIMIT 20;
 ```
 
-For this feature to be considered working, `source` should be `sendgrid`, `type`
-should be `hard`, and `campaign_id` must be populated.
+For this feature to be considered working, lifecycle `provider` should be
+`sendgrid`, `campaign_id` must be populated, and each real successful test send
+must produce one `delivered` event. The controlled bounce must still have
+`source=sendgrid`, `type=hard`, and a populated `campaign_id`.
+
+Campaigns started before `delivery.sendgrid_tracking_started_at` intentionally
+show an estimated Delivered value calculated as `MAX(sent - bounces, 0)`.
+Campaigns started after that timestamp must use actual provider events only.
+
+If rollback is required, disable `Processed`, `Dropped`, `Deferred`, and
+`Delivered` before restoring the previous image; leave `Bounced` enabled so the
+older handler continues processing bounces. The delivery-event migration is
+additive and may remain unless the rollback assessment requires restoring the
+pre-deployment backup.
 
 ## Production SendGrid validation record
 
