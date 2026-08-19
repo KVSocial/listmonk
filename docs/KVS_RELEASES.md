@@ -231,19 +231,31 @@ Rules:
 1. Confirm every intended PR is merged into `kvs-main`.
 2. Confirm `KVSocial CI` is green on the latest `kvs-main` commit.
 3. Fetch the exact remote commit and tags.
-4. Create an annotated tag on that commit.
-5. Push only the tag.
+4. Set `RELEASE_TAG` to the next unused immutable KVSocial revision and verify
+   that it does not already exist remotely.
+5. Create an annotated tag on the fetched `kvs-main` commit.
+6. Push only the tag.
 
 ```sh
 git fetch origin kvs-main --tags
 
 git rev-parse origin/kvs-main
 
-git tag -a v6.2.0-kvs.1 origin/kvs-main \
-  -m "KVSocial Listmonk v6.2.0-kvs.1"
+RELEASE_TAG="v6.2.0-kvs.2"
 
-git push origin v6.2.0-kvs.1
+if git ls-remote --exit-code --tags origin "refs/tags/${RELEASE_TAG}" >/dev/null 2>&1; then
+  echo "Release tag already exists: ${RELEASE_TAG}" >&2
+  exit 1
+fi
+
+git tag -a "$RELEASE_TAG" origin/kvs-main \
+  -m "KVSocial Listmonk ${RELEASE_TAG}"
+
+git push origin "$RELEASE_TAG"
 ```
+
+The value above is an example candidate. Recheck the remote tags at release
+time and increment the KVSocial revision if it has already been used.
 
 The `KVSocial GHCR release` workflow then:
 
@@ -256,7 +268,7 @@ The `KVSocial GHCR release` workflow then:
 Expected images:
 
 ```text
-ghcr.io/kvsocial/listmonk:v6.2.0-kvs.1
+ghcr.io/kvsocial/listmonk:<release-tag>
 ghcr.io/kvsocial/listmonk:kvs-latest
 ```
 
@@ -322,15 +334,24 @@ docker compose --env-file .env -f compose.yml exec -T db sh -lc \
 
 Confirm the backup is present and non-empty before continuing.
 
-### 2. Pin the new image
+### 2. Pin the verified new image
 
-In `compose.yml`, use the immutable image:
+In `compose.yml`, replace `<release-tag>` with the exact tag that completed the
+`KVSocial GHCR release` workflow successfully:
 
 ```yaml
-image: ghcr.io/kvsocial/listmonk:v6.2.0-kvs.1
+image: ghcr.io/kvsocial/listmonk:<release-tag>
 ```
 
-Do not deploy `kvs-latest` in production.
+Confirm the resolved Compose configuration shows that exact immutable tag before
+pulling it:
+
+```sh
+docker compose --env-file .env -f compose.yml config --images
+```
+
+Do not deploy `kvs-latest`, reuse an existing tag, or leave the placeholder in
+production.
 
 ### 3. Pull and restart only Listmonk
 
