@@ -523,6 +523,25 @@ body.is-noscroll {
   }
 }
 
+/* Page size selector in the table's bottom-left slot, on the same row as the pagination.
+   Buefy also gives the bottom bar the `top` class, so it is matched by its position after the table. */
+.b-table .table-wrapper ~ .top.level {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 10px;
+
+  .level-left {
+    width: auto;
+    min-width: 0;
+  }
+}
+.per-page {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
 
 /* Fix for input colours */
 .button {
