@@ -213,7 +213,7 @@ export default Vue.extend({
       isEditing: false,
       isFormVisible: false,
       lists: [],
-      perPageOptions: [20, 50, 100, 200],
+      perPageOptions: [20, 50, 100, 200, 500],
       queryParams: {
         page: 1,
         perPage: 20,
