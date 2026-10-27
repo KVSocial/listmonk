@@ -165,11 +165,13 @@
       </b-table-column>
 
       <template #bottom-left>
-        <b-field :label="$t('globals.terms.perPage')" horizontal custom-class="is-small" class="mb-0">
-          <b-select :value="queryParams.perPage" @input="onPerPageChange" size="is-small" data-cy="per-page">
+        <div class="per-page">
+          <label for="per-page" class="is-size-7 has-text-grey">{{ $t('globals.terms.perPage') }}</label>
+          <b-select id="per-page" :value="queryParams.perPage" @input="onPerPageChange" size="is-small"
+            data-cy="per-page">
             <option v-for="n in perPageOptions" :key="n" :value="n">{{ n }}</option>
           </b-select>
-        </b-field>
+        </div>
       </template>
 
       <template #empty v-if="!loading.listsFull">
