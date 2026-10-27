@@ -164,6 +164,14 @@
         </div>
       </b-table-column>
 
+      <template #bottom-left>
+        <b-field :label="$t('globals.terms.perPage')" horizontal custom-class="is-small" class="mb-0">
+          <b-select :value="queryParams.perPage" @input="onPerPageChange" size="is-small" data-cy="per-page">
+            <option v-for="n in perPageOptions" :key="n" :value="n">{{ n }}</option>
+          </b-select>
+        </b-field>
+      </template>
+
       <template #empty v-if="!loading.listsFull">
         <empty-placeholder />
       </template>
@@ -203,8 +211,10 @@ export default Vue.extend({
       isEditing: false,
       isFormVisible: false,
       lists: [],
+      perPageOptions: [20, 50, 100, 200],
       queryParams: {
         page: 1,
+        perPage: 20,
         query: '',
         orderBy: 'id',
         order: 'asc',
@@ -228,6 +238,12 @@ export default Vue.extend({
     onSort(field, direction) {
       this.queryParams.orderBy = field;
       this.queryParams.order = direction;
+      this.getLists();
+    },
+
+    onPerPageChange(n) {
+      this.queryParams.perPage = n;
+      this.queryParams.page = 1;
       this.getLists();
     },
 
@@ -267,6 +283,7 @@ export default Vue.extend({
     getLists() {
       this.$api.queryLists({
         page: this.queryParams.page,
+        per_page: this.queryParams.perPage,
         query: this.queryParams.query.replace(/[^\p{L}\p{N}\s]/gu, ' '),
         order_by: this.queryParams.orderBy,
         order: this.queryParams.order,
