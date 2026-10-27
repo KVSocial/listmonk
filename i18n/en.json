@@ -246,6 +246,7 @@
     "globals.terms.month": "Month | Months",
     "globals.terms.none": "None",
     "globals.terms.new": "New",
+    "globals.terms.perPage": "Per page",
     "globals.terms.second": "Second | Seconds",
     "globals.terms.settings": "Settings",
     "globals.terms.subscriber": "Subscriber | Subscribers",
