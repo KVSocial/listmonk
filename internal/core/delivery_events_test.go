@@ -131,7 +131,8 @@ func newDeliveryEventsTestCore(t *testing.T) (*Core, *sqlx.DB) {
 			Count  int
 			Action string
 		}{
-			models.BounceTypeHard: {Count: 1, Action: "blocklist"},
+			models.BounceTypeHard:      {Count: 1, Action: "blocklist"},
+			models.BounceTypeComplaint: {Count: 1, Action: "blocklist"},
 		}},
 		DB:      db,
 		Queries: queries,
@@ -268,5 +269,54 @@ func TestRecordCampaignDeliveryEventsUnattributedBounceFallback(t *testing.T) {
 	}
 	if status != "blocklisted" {
 		t.Fatalf("fallback subscriber status = %q, want blocklisted", status)
+	}
+}
+
+func TestRecordCampaignDeliveryEventsSpamReportComplaint(t *testing.T) {
+	co, db := newDeliveryEventsTestCore(t)
+
+	const (
+		campaignUUID   = "5f0b1a3e-8c2d-4e7f-9a61-2b3c4d5e6f70"
+		subscriberUUID = "8a7b6c5d-4e3f-4a1b-9c8d-7e6f5a4b3c2d"
+	)
+	if _, err := db.Exec(`INSERT INTO campaigns (uuid) VALUES ($1)`, campaignUUID); err != nil {
+		t.Fatalf("insert campaign: %v", err)
+	}
+	var subscriberID int
+	if err := db.Get(&subscriberID, `INSERT INTO subscribers (uuid, email, status) VALUES ($1, $2, 'enabled') RETURNING id`,
+		subscriberUUID, "complainer@example.com"); err != nil {
+		t.Fatalf("insert subscriber: %v", err)
+	}
+
+	spam := models.CampaignDeliveryEvent{
+		Provider:        "sendgrid",
+		ProviderEventID: "spamreport-event-1",
+		EventType:       models.DeliveryEventSpamReport,
+		CampaignUUID:    campaignUUID,
+		SubscriberUUID:  subscriberUUID,
+		Email:           "complainer@example.com",
+		BounceType:      models.BounceTypeComplaint,
+		Meta:            json.RawMessage(`{}`),
+		OccurredAt:      time.Now().UTC(),
+	}
+	for range 2 {
+		if _, err := co.RecordCampaignDeliveryEvents([]models.CampaignDeliveryEvent{spam}); err != nil {
+			t.Fatalf("record spam report event: %v", err)
+		}
+	}
+
+	var bounceTypes []string
+	if err := db.Select(&bounceTypes, `SELECT type FROM bounces WHERE subscriber_id = $1`, subscriberID); err != nil {
+		t.Fatalf("get bounces: %v", err)
+	}
+	if len(bounceTypes) != 1 || bounceTypes[0] != models.BounceTypeComplaint {
+		t.Fatalf("bounce records = %v, want one complaint", bounceTypes)
+	}
+	var status string
+	if err := db.Get(&status, `SELECT status FROM subscribers WHERE id = $1`, subscriberID); err != nil {
+		t.Fatalf("get subscriber status: %v", err)
+	}
+	if status != "blocklisted" {
+		t.Fatalf("subscriber status = %q, want blocklisted", status)
 	}
 }

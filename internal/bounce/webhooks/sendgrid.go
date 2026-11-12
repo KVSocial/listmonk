@@ -76,18 +76,22 @@ func (s *Sendgrid) ProcessEvents(sig, timestamp string, b []byte) ([]models.Camp
 			models.DeliveryEventDeferred,
 			models.DeliveryEventDelivered,
 			models.DeliveryEventBounce,
-			models.DeliveryEventDropped:
+			models.DeliveryEventDropped,
+			models.DeliveryEventSpamReport:
 		default:
 			unsupported++
 			continue
 		}
 
 		bounceType := ""
-		if eventType == models.DeliveryEventBounce {
+		switch eventType {
+		case models.DeliveryEventBounce:
 			bounceType = models.BounceTypeHard
 			if n.BounceClassification == "technical" || n.BounceClassification == "content" {
 				bounceType = models.BounceTypeSoft
 			}
+		case models.DeliveryEventSpamReport:
+			bounceType = models.BounceTypeComplaint
 		}
 
 		meta, err := json.Marshal(map[string]any{

@@ -14,8 +14,9 @@ type deliveryEventInsertResult struct {
 }
 
 // RecordCampaignDeliveryEvents stores a signed provider batch atomically.
-// New bounce events invoke the existing bounce workflow in the same transaction,
-// while duplicate provider event IDs do not repeat bounce side effects.
+// New bounce and spam report events invoke the existing bounce workflow in the
+// same transaction, while duplicate provider event IDs do not repeat bounce
+// side effects.
 func (c *Core) RecordCampaignDeliveryEvents(events []models.CampaignDeliveryEvent) (models.CampaignDeliveryEventResult, error) {
 	var result models.CampaignDeliveryEventResult
 	if len(events) == 0 {
@@ -62,9 +63,10 @@ func (c *Core) RecordCampaignDeliveryEvents(events []models.CampaignDeliveryEven
 		result.Inserted++
 
 		// An event without a matching campaign cannot contribute to campaign
-		// delivery metrics. A newly inserted bounce can still protect the
-		// subscriber through the existing email fallback workflow below.
-		if event.EventType != models.DeliveryEventBounce || inserted.SubscriberID == 0 {
+		// delivery metrics. A newly inserted bounce or spam report can still
+		// protect the subscriber through the existing email fallback workflow
+		// below.
+		if event.BounceType == "" || inserted.SubscriberID == 0 {
 			continue
 		}
 
