@@ -141,8 +141,9 @@ unique_clicks AS (
     GROUP BY campaign_id
 ),
 bounces AS (
+    -- Complaints were delivered, so they are not bounces.
     SELECT campaign_id, COUNT(campaign_id) as num FROM bounces
-    WHERE campaign_id = ANY($1)
+    WHERE campaign_id = ANY($1) AND type != 'complaint'
     GROUP BY campaign_id
 ),
 deliveries AS (
@@ -326,7 +327,7 @@ WITH intval AS (
 )
 SELECT campaign_id, COUNT(*) AS "count", DATE_TRUNC((SELECT * FROM intval), created_at) AS "timestamp"
     FROM bounces
-    WHERE campaign_id=ANY($1) AND created_at >= $2 AND created_at <= $3
+    WHERE campaign_id=ANY($1) AND type != 'complaint' AND created_at >= $2 AND created_at <= $3
     GROUP BY campaign_id, "timestamp" ORDER BY "timestamp" ASC;
 
 -- name: get-campaign-link-counts
