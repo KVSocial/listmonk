@@ -101,10 +101,32 @@ func TestSendGridProcessEvents(t *testing.T) {
 	if events[5].BounceType != models.BounceTypeComplaint {
 		t.Errorf("spam report bounce type = %q, want complaint", events[5].BounceType)
 	}
-	for i := range 3 {
+	for _, i := range []int{0, 1, 2, 4} {
 		if events[i].BounceType != "" {
 			t.Errorf("event %d bounce type = %q, want empty", i, events[i].BounceType)
 		}
+	}
+}
+
+func TestSendGridProcessEventsSpamReportingAddressDrop(t *testing.T) {
+	payload := []byte(`[
+		{"email":"user@example.com","timestamp":1787040001,"event":"dropped","sg_event_id":"event-1","reason":"Spam Reporting Address"},
+		{"email":"user@example.com","timestamp":1787040002,"event":"dropped","sg_event_id":"event-2","reason":"Bounced Address"}
+	]`)
+	sg, signature, timestamp := newSignedSendGrid(t, payload)
+
+	events, _, err := sg.ProcessEvents(signature, timestamp, payload)
+	if err != nil {
+		t.Fatalf("ProcessEvents() error = %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("ProcessEvents() returned %d events, want 2", len(events))
+	}
+	if events[0].EventType != models.DeliveryEventDropped || events[0].BounceType != models.BounceTypeComplaint {
+		t.Errorf("spam reporting drop = %q/%q, want dropped/complaint", events[0].EventType, events[0].BounceType)
+	}
+	if events[1].BounceType != "" {
+		t.Errorf("bounced address drop bounce type = %q, want empty", events[1].BounceType)
 	}
 }
 

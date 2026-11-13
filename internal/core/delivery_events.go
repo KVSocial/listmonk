@@ -72,6 +72,13 @@ func (c *Core) RecordCampaignDeliveryEvents(events []models.CampaignDeliveryEven
 
 		action, ok := c.consts.BounceActions[event.BounceType]
 		if !ok {
+			// Complaints are optional in bounce.actions. Without a configured
+			// action, keep the delivery event rather than failing the whole
+			// provider batch, which the provider would otherwise retry.
+			if event.BounceType == models.BounceTypeComplaint {
+				c.log.Printf("no bounce action configured for complaints; skipping %s event %s", event.Provider, event.ProviderEventID)
+				continue
+			}
 			return result, fmt.Errorf("invalid bounce type %q", event.BounceType)
 		}
 		if _, err := bounceStmt.Exec(

@@ -320,3 +320,85 @@ func TestRecordCampaignDeliveryEventsSpamReportComplaint(t *testing.T) {
 		t.Fatalf("subscriber status = %q, want blocklisted", status)
 	}
 }
+
+func TestRecordCampaignDeliveryEventsUnattributedSpamReportFallback(t *testing.T) {
+	co, db := newDeliveryEventsTestCore(t)
+
+	var subscriberID int
+	if err := db.Get(&subscriberID, `INSERT INTO subscribers (uuid, email, status) VALUES ($1, $2, 'enabled') RETURNING id`,
+		"0c1d2e3f-4a5b-4c6d-8e7f-9a0b1c2d3e4f", "spam-fallback@example.com"); err != nil {
+		t.Fatalf("insert subscriber: %v", err)
+	}
+
+	event := models.CampaignDeliveryEvent{
+		Provider:        "sendgrid",
+		ProviderEventID: "unattributed-spamreport-1",
+		EventType:       models.DeliveryEventSpamReport,
+		Email:           "spam-fallback@example.com",
+		BounceType:      models.BounceTypeComplaint,
+		Meta:            json.RawMessage(`{}`),
+		OccurredAt:      time.Now().UTC(),
+	}
+	result, err := co.RecordCampaignDeliveryEvents([]models.CampaignDeliveryEvent{event})
+	if err != nil {
+		t.Fatalf("record unattributed spam report: %v", err)
+	}
+	if result.Inserted != 1 || result.Unattributed != 1 {
+		t.Fatalf("unattributed result = %#v", result)
+	}
+
+	var bounceType, status string
+	if err := db.Get(&bounceType, `SELECT type FROM bounces WHERE subscriber_id = $1`, subscriberID); err != nil {
+		t.Fatalf("get complaint: %v", err)
+	}
+	if err := db.Get(&status, `SELECT status FROM subscribers WHERE id = $1`, subscriberID); err != nil {
+		t.Fatalf("get subscriber status: %v", err)
+	}
+	if bounceType != models.BounceTypeComplaint || status != "blocklisted" {
+		t.Fatalf("fallback complaint = %q, status = %q, want complaint/blocklisted", bounceType, status)
+	}
+}
+
+func TestRecordCampaignDeliveryEventsSkipsUnconfiguredComplaint(t *testing.T) {
+	co, db := newDeliveryEventsTestCore(t)
+	delete(co.consts.BounceActions, models.BounceTypeComplaint)
+
+	const subscriberUUID = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+	if _, err := db.Exec(`INSERT INTO subscribers (uuid, email, status) VALUES ($1, $2, 'enabled')`,
+		subscriberUUID, "unconfigured@example.com"); err != nil {
+		t.Fatalf("insert subscriber: %v", err)
+	}
+
+	batch := []models.CampaignDeliveryEvent{
+		{
+			Provider: "sendgrid", ProviderEventID: "unconfigured-delivered",
+			EventType: models.DeliveryEventDelivered, SubscriberUUID: subscriberUUID,
+			Email: "unconfigured@example.com", Meta: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
+		},
+		{
+			Provider: "sendgrid", ProviderEventID: "unconfigured-spamreport",
+			EventType: models.DeliveryEventSpamReport, SubscriberUUID: subscriberUUID,
+			Email: "unconfigured@example.com", BounceType: models.BounceTypeComplaint,
+			Meta: json.RawMessage(`{}`), OccurredAt: time.Now().UTC(),
+		},
+	}
+	result, err := co.RecordCampaignDeliveryEvents(batch)
+	if err != nil {
+		t.Fatalf("batch with unconfigured complaint action failed: %v", err)
+	}
+	if result.Inserted != 2 {
+		t.Fatalf("result = %#v, want both events stored", result)
+	}
+
+	var bounceCount int
+	if err := db.Get(&bounceCount, `SELECT COUNT(*) FROM bounces`); err != nil {
+		t.Fatalf("count bounces: %v", err)
+	}
+	var status string
+	if err := db.Get(&status, `SELECT status FROM subscribers WHERE uuid = $1`, subscriberUUID); err != nil {
+		t.Fatalf("get subscriber status: %v", err)
+	}
+	if bounceCount != 0 || status != "enabled" {
+		t.Fatalf("bounces = %d, status = %q, want no complaint recorded", bounceCount, status)
+	}
+}
