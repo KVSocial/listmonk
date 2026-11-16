@@ -90,6 +90,8 @@ type Queries struct {
 	NextCampaigns            *sqlx.Stmt `query:"next-campaigns"`
 	GetRunningCampaign       *sqlx.Stmt `query:"get-running-campaign"`
 	NextCampaignSubscribers  *sqlx.Stmt `query:"next-campaign-subscribers"`
+	GetRecipientEstimate     *sqlx.Stmt `query:"get-recipient-estimate"`
+	UpdateCampaignDailySent  *sqlx.Stmt `query:"update-campaign-daily-sent"`
 	GetOneCampaignSubscriber *sqlx.Stmt `query:"get-one-campaign-subscriber"`
 	UpdateCampaign           *sqlx.Stmt `query:"update-campaign"`
 	UpdateCampaignStatus     *sqlx.Stmt `query:"update-campaign-status"`

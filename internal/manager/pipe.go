@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -82,7 +83,10 @@ func (p *pipe) NextSubscribers() (bool, error) {
 	// Fetch the next batch of subscribers from a 'running' campaign.
 	subs, err := p.m.store.NextSubscribers(p.camp.ID, p.m.cfg.BatchSize)
 	if err != nil {
-		return false, fmt.Errorf("error fetching campaign subscribers (%s): %v", p.camp.Name, err)
+		if errors.Is(err, ErrDailyLimitReached) {
+			return false, err
+		}
+		return false, fmt.Errorf("error fetching campaign subscribers (%s): %w", p.camp.Name, err)
 	}
 
 	// There are no subscribers from the query. Either all subscribers on the campaign

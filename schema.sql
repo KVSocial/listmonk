@@ -122,6 +122,12 @@ CREATE TABLE campaigns (
     max_subscriber_id  INT NOT NULL DEFAULT 0,
     last_subscriber_id INT NOT NULL DEFAULT 0,
 
+    -- Optional per-campaign daily send cap (0 = unlimited). daily_sent counts
+    -- messages queued in the current 24h window that began at daily_window_start.
+    daily_limit        INT NOT NULL DEFAULT 0,
+    daily_sent         INT NOT NULL DEFAULT 0,
+    daily_window_start TIMESTAMP WITH TIME ZONE NULL,
+
     -- Publishing.
     archive             BOOLEAN NOT NULL DEFAULT false,
     archive_slug        TEXT NULL UNIQUE,

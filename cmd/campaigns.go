@@ -729,6 +729,10 @@ func (a *App) validateCampaignFields(c campReq) (campReq, error) {
 		return c, errors.New(a.i18n.T("campaigns.fieldInvalidListIDs"))
 	}
 
+	if c.DailyLimit < 0 {
+		c.DailyLimit = 0
+	}
+
 	if !a.manager.HasMessenger(c.Messenger) {
 		// If it's a specific SMTP, but it's no longer available (removed/disabled), fall back to general email messenger.
 		if strings.HasPrefix(c.Messenger, "email-") {
@@ -858,4 +862,26 @@ func canEditCampaign(status string) bool {
 	return status == models.CampaignStatusDraft ||
 		status == models.CampaignStatusPaused ||
 		status == models.CampaignStatusScheduled
+}
+
+// GetRecipientEstimate returns an approximate number of recipients for the
+// given list IDs (?list_id=1&list_id=2) based on the cached list stats.
+func (a *App) GetRecipientEstimate(c echo.Context) error {
+	ids, err := parseStringIDs(c.Request().URL.Query()["list_id"])
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, a.i18n.Ts("globals.messages.invalidID", "error", err.Error()))
+	}
+
+	var count int64
+	if len(ids) > 0 {
+		if err := queries.GetRecipientEstimate.Get(&count, pq.Array(ids)); err != nil {
+			a.log.Printf("error fetching recipient estimate: %v", err)
+			return echo.NewHTTPError(http.StatusInternalServerError,
+				a.i18n.Ts("globals.messages.errorFetching", "name", "{globals.terms.lists}", "error", err.Error()))
+		}
+	}
+
+	return c.JSON(http.StatusOK, okResp{struct {
+		Count int64 `json:"count"`
+	}{count}})
 }

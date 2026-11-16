@@ -25,7 +25,7 @@ WITH tpl AS (
 camp AS (
     INSERT INTO campaigns (uuid, type, name, subject, from_email, body, altbody,
         content_type, send_at, headers, attribs, tags, messenger, template_id, to_send,
-        max_subscriber_id, archive, archive_slug, archive_template_id, archive_meta, body_source)
+        max_subscriber_id, archive, archive_slug, archive_template_id, archive_meta, body_source, daily_limit)
         SELECT $1, $2, $3, $4, $5,
             -- body
             COALESCE(NULLIF($6, ''), (SELECT body FROM tpl), ''),
@@ -40,7 +40,9 @@ camp AS (
             $18,
             $19,
             -- body_source
-            COALESCE($21, (SELECT body_source FROM tpl))
+            COALESCE($21, (SELECT body_source FROM tpl)),
+            -- daily_limit
+            GREATEST(COALESCE($22::INT, 0), 0)
         RETURNING id
 ),
 med AS (
@@ -68,7 +70,15 @@ SELECT  c.*,
                 campaign_lists.list_name AS name
                 FROM campaign_lists WHERE campaign_lists.campaign_id = c.id
         ) l
-    ) AS lists
+    ) AS lists,
+    -- Approximate recipient count from the cached list stats (may count a
+    -- subscriber once per list they're on).
+    (
+        SELECT COALESCE(SUM(m.subscriber_count), 0) FROM mat_list_subscriber_stats m
+        JOIN lists ON lists.id = m.list_id
+        WHERE m.list_id IN (SELECT list_id FROM campaign_lists WHERE campaign_lists.campaign_id = c.id)
+        AND (CASE WHEN lists.optin = 'double' THEN m.status = 'confirmed' ELSE m.status != 'unsubscribed' END)
+    ) AS est_recipients
 FROM campaigns c
 WHERE ($1 = 0 OR id = $1)
     AND (CARDINALITY($2::campaign_status[]) = 0 OR status = ANY($2))
@@ -81,6 +91,14 @@ WHERE ($1 = 0 OR id = $1)
         )
     )
 ORDER BY %order% OFFSET $7 LIMIT (CASE WHEN $8 < 1 THEN NULL ELSE $8 END);
+
+-- name: get-recipient-estimate
+-- Returns an approximate recipient count for a set of lists from the cached list
+-- stats. A subscriber on multiple lists is counted once per list.
+SELECT COALESCE(SUM(m.subscriber_count), 0) FROM mat_list_subscriber_stats m
+    JOIN lists ON lists.id = m.list_id
+    WHERE m.list_id = ANY($1::INT[])
+    AND (CASE WHEN lists.optin = 'double' THEN m.status = 'confirmed' ELSE m.status != 'unsubscribed' END);
 
 -- name: get-campaign
 SELECT campaigns.*,
@@ -248,6 +266,13 @@ WITH camps AS (
     LEFT JOIN templates ON (templates.id = campaigns.template_id)
     WHERE (status='running' OR (status='scheduled' AND NOW() >= campaigns.send_at))
     AND NOT(campaigns.id = ANY($1::INT[]))
+    -- Skip campaigns that have exhausted their daily send limit in the current 24h window.
+    AND NOT (
+        campaigns.daily_limit > 0
+        AND campaigns.daily_window_start IS NOT NULL
+        AND NOW() < campaigns.daily_window_start + INTERVAL '1 day'
+        AND campaigns.daily_sent >= campaigns.daily_limit
+    )
 ),
 campLists AS (
     -- Get the list_ids and their optin statuses for the campaigns found in the previous step.
@@ -372,7 +397,8 @@ SELECT link_clicks.campaign_id,
 -- name: get-running-campaign
 -- Returns the metadata for a running campaign that is required by next-campaign-subscribers to retrieve
 -- a batch of campaign subscribers for processing.
-SELECT campaigns.id AS campaign_id, campaigns.type as campaign_type, last_subscriber_id, max_subscriber_id, lists.id AS list_id
+SELECT campaigns.id AS campaign_id, campaigns.type as campaign_type, last_subscriber_id, max_subscriber_id,
+    daily_limit, daily_sent, daily_window_start, lists.id AS list_id
     FROM campaigns
     JOIN campaign_lists ON (campaign_lists.campaign_id = campaigns.id)
     JOIN lists ON (lists.id = campaign_lists.list_id)
@@ -475,6 +501,7 @@ WITH camp AS (
         archive_template_id=(CASE WHEN $7::content_type = 'visual' THEN NULL ELSE $17::INT END),
         archive_meta=$18,
         body_source=$20,
+        daily_limit=GREATEST(COALESCE($21::INT, 0), 0),
         updated_at=NOW()
     WHERE id = $1 RETURNING id
 ),
@@ -494,6 +521,10 @@ medi AS (
 INSERT INTO campaign_lists (campaign_id, list_id, list_name)
     (SELECT $1 as campaign_id, id, name FROM lists WHERE id=ANY($14::INT[]))
     ON CONFLICT (campaign_id, list_id) DO UPDATE SET list_name = EXCLUDED.list_name;
+
+-- name: update-campaign-daily-sent
+-- Records the number of messages queued in the current daily window of a campaign.
+UPDATE campaigns SET daily_window_start=$2, daily_sent=$3 WHERE id=$1;
 
 -- name: update-campaign-counts
 UPDATE campaigns SET

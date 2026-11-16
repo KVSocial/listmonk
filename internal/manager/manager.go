@@ -25,6 +25,11 @@ import (
 	"golang.org/x/text/language"
 )
 
+// ErrDailyLimitReached is returned by Store.NextSubscribers when a campaign has
+// used up its daily send limit for the current 24h window. The campaign stays
+// 'running' and is picked up again by the scanner once the window expires.
+var ErrDailyLimitReached = errors.New("daily send limit reached")
+
 // attribInlineEmbed is the HTML attrib used to mark <img> tags whose source
 // should be embedded as a multipart cid inline attachment.
 const attribInlineEmbed = "data-embed"
@@ -295,7 +300,11 @@ func (m *Manager) Run() {
 	for p := range m.nextPipes {
 		has, err := p.NextSubscribers()
 		if err != nil {
-			m.log.Printf("error processing campaign batch (%s): %v", p.camp.Name, err)
+			if errors.Is(err, ErrDailyLimitReached) {
+				m.log.Printf("campaign (%s) reached its daily limit of %d. Resuming in the next window.", p.camp.Name, p.camp.DailyLimit)
+			} else {
+				m.log.Printf("error processing campaign batch (%s): %v", p.camp.Name, err)
+			}
 
 			// If the batch fails, stop the pipe and release it so that it doesn't hang forever.
 			// The cleanup() records the state in DB and scanCampaigns() picks it up at a later point.

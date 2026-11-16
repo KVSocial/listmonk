@@ -60,6 +60,15 @@ type Campaign struct {
 	ArchiveTemplateID null.Int        `db:"archive_template_id" json:"archive_template_id"`
 	ArchiveMeta       json.RawMessage `db:"archive_meta" json:"archive_meta"`
 
+	// Optional daily send cap (0 = unlimited). DailySent is the number of
+	// messages queued in the current 24h window that began at DailyWindowStart.
+	DailyLimit       int       `db:"daily_limit" json:"daily_limit"`
+	DailySent        int       `db:"daily_sent" json:"daily_sent"`
+	DailyWindowStart null.Time `db:"daily_window_start" json:"daily_window_start"`
+
+	// Approximate recipients, only populated by query-campaigns.
+	EstRecipients int64 `db:"est_recipients" json:"est_recipients"`
+
 	// TemplateBody is joined in from templates by the next-campaigns query.
 	TemplateBody        string             `db:"template_body" json:"-"`
 	ArchiveTemplateBody string             `db:"archive_template_body" json:"-"`

@@ -80,6 +80,11 @@
 
                 <list-selector v-model="form.lists" :selected="form.lists" :all="lists.results" :disabled="!canEdit"
                   :label="$t('globals.terms.lists')" :placeholder="$t('campaigns.sendToLists')" />
+                <p v-if="form.lists.length > 0 && estRecipients !== null" class="is-size-7 has-text-grey mb-4"
+                  data-cy="recipient-estimate">
+                  <b-icon icon="account-multiple-outline" size="is-small" />
+                  {{ $t('campaigns.recipientEstimate', { num: $utils.formatNumber(estRecipients) }) }}
+                </p>
 
                 <div class="columns">
                   <div class="column is-6">
@@ -136,6 +141,12 @@
                     </b-field>
                   </div>
                 </div>
+
+                <b-field :label="$t('campaigns.dailyLimit')" label-position="on-border" class="mt-4"
+                  :message="dailyLimitMessage" data-cy="daily-limit">
+                  <b-numberinput v-model="form.dailyLimit" :disabled="!canEdit" :min="0" :step="100"
+                    :controls="false" name="daily_limit" placeholder="0" expanded />
+                </b-field>
 
                 <div>
                   <p class="has-text-right">
@@ -393,7 +404,12 @@ export default Vue.extend({
         archiveMetaStr: '{}',
         archiveMeta: {},
         testEmails: [],
+        dailyLimit: 0,
       },
+
+      // Approximate recipient count for the selected lists.
+      estRecipients: null,
+      estTimer: null,
     };
   },
 
@@ -435,6 +451,22 @@ export default Vue.extend({
       }
 
       this.form.media.push(o);
+    },
+
+    // Fetch the approximate recipient count for the selected lists (debounced).
+    fetchRecipientEstimate() {
+      clearTimeout(this.estTimer);
+      const ids = this.form.lists.map((l) => l.id);
+      if (ids.length === 0) {
+        this.estRecipients = null;
+        return;
+      }
+
+      this.estTimer = setTimeout(() => {
+        this.$api.getRecipientEstimate(ids).then((d) => {
+          this.estRecipients = d.count;
+        });
+      }, 300);
     },
 
     isUnsaved() {
@@ -580,6 +612,7 @@ export default Vue.extend({
         headers: this.form.headers,
         attribs: this.form.attribs,
         media: this.form.media.map((m) => m.id),
+        daily_limit: Number(this.form.dailyLimit) || 0,
       };
 
       this.$api.createCampaign(data).then((d) => {
@@ -610,6 +643,7 @@ export default Vue.extend({
         archive_template_id: this.form.archiveTemplateId,
         archive_meta: this.form.archiveMeta,
         media: this.form.media.map((m) => m.id),
+        daily_limit: Number(this.form.dailyLimit) || 0,
       };
 
       let typMsg = 'globals.messages.updated';
@@ -727,6 +761,21 @@ export default Vue.extend({
       return this.lists.results.filter((l) => this.selListIDs.indexOf(l.id) > -1);
     },
 
+    // Help text for the daily limit, with how many days sending will take.
+    dailyLimitMessage() {
+      const help = this.$t('campaigns.dailyLimitHelp');
+      const limit = Number(this.form.dailyLimit) || 0;
+      if (limit <= 0 || !this.estRecipients) {
+        return help;
+      }
+
+      const days = this.$t('campaigns.dailyLimitDays', {
+        num: this.$utils.formatNumber(limit),
+        days: Math.ceil(this.estRecipients / limit),
+      });
+      return `${days} ${help}`;
+    },
+
     emailMessengers() {
       return ['email', ...this.serverConfig.messengers.filter((m) => m.startsWith('email-'))];
     },
@@ -745,6 +794,10 @@ export default Vue.extend({
   },
 
   watch: {
+    'form.lists': function onLists() {
+      this.fetchRecipientEstimate();
+    },
+
     selectedLists() {
       this.form.lists = this.selectedLists;
     },
