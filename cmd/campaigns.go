@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/knadh/listmonk/internal/auth"
+	"github.com/knadh/listmonk/internal/core"
 	"github.com/knadh/listmonk/internal/notifs"
 	"github.com/knadh/listmonk/models"
 	"github.com/labstack/echo/v4"
@@ -328,7 +329,27 @@ func (a *App) UpdateCampaign(c echo.Context) error {
 
 	// Filter lists against the current user's permitted lists.
 	user := auth.GetUser(c)
-	o.ListIDs = user.FilterListsByPerm(auth.PermTypeGet|auth.PermTypeManage, o.ListIDs)
+	if cm.StartedAt.Valid {
+		// A started campaign's audience was frozen when it began sending, so its
+		// lists can no longer change. Compare only the lists this user can see,
+		// then keep the stored set as is.
+		curIDs, err := core.CampaignListIDs(cm.Lists)
+		if err != nil {
+			a.log.Printf("error reading lists of campaign %d: %v", id, err)
+			return echo.NewHTTPError(http.StatusInternalServerError,
+				a.i18n.Ts("globals.messages.errorFetching", "name", "{globals.terms.lists}", "error", err.Error()))
+		}
+		if o.ListIDs != nil {
+			want := user.FilterListsByPerm(auth.PermTypeGet|auth.PermTypeManage, o.ListIDs)
+			have := user.FilterListsByPerm(auth.PermTypeGet|auth.PermTypeManage, curIDs)
+			if !core.SameIDSet(want, have) {
+				return echo.NewHTTPError(http.StatusBadRequest, a.i18n.T("campaigns.cantChangeListsStarted"))
+			}
+		}
+		o.ListIDs = curIDs
+	} else {
+		o.ListIDs = user.FilterListsByPerm(auth.PermTypeGet|auth.PermTypeManage, o.ListIDs)
+	}
 
 	if c, err := a.validateCampaignFields(o); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())

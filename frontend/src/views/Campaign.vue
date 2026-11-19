@@ -78,8 +78,12 @@
                     :placeholder="$t('campaigns.fromAddressPlaceholder')" required />
                 </b-field>
 
-                <list-selector v-model="form.lists" :selected="form.lists" :all="lists.results" :disabled="!canEdit"
-                  :label="$t('globals.terms.lists')" :placeholder="$t('campaigns.sendToLists')" />
+                <list-selector v-model="form.lists" :selected="form.lists" :all="lists.results"
+                  :disabled="!canEdit || hasStarted" :label="$t('globals.terms.lists')"
+                  :placeholder="$t('campaigns.sendToLists')" />
+                <p v-if="canEdit && hasStarted" class="is-size-7 has-text-grey mb-2" data-cy="lists-locked">
+                  {{ $t('campaigns.listsLockedStarted') }}
+                </p>
                 <p v-if="form.lists.length > 0 && estRecipients !== null" class="is-size-7 has-text-grey mb-4"
                   data-cy="recipient-estimate">
                   <b-icon icon="account-multiple-outline" size="is-small" />
@@ -719,6 +723,11 @@ export default Vue.extend({
     canEdit() {
       return this.isNew
         || this.data.status === 'draft' || this.data.status === 'scheduled' || this.data.status === 'paused';
+    },
+
+    // A campaign's audience is frozen once it starts sending, so its lists are locked.
+    hasStarted() {
+      return !this.isNew && !!this.data.startedAt;
     },
 
     canSchedule() {

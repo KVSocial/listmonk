@@ -2,11 +2,13 @@ package core
 
 import (
 	"database/sql"
+	"encoding/json"
 	"net/http"
 	"time"
 
 	"github.com/gofrs/uuid/v5"
 	"github.com/jmoiron/sqlx"
+	"github.com/jmoiron/sqlx/types"
 	"github.com/knadh/listmonk/models"
 	"github.com/labstack/echo/v4"
 	"github.com/lib/pq"
@@ -20,6 +22,52 @@ const (
 	campaignTplDefault = "default"
 	campaignTplArchive = "archive"
 )
+
+// CampaignListIDs returns the IDs in a campaign's stored lists JSON, skipping
+// lists that have since been deleted (ID 0).
+func CampaignListIDs(lists types.JSONText) ([]int, error) {
+	var items []struct {
+		ID int `json:"id"`
+	}
+	if len(lists) > 0 {
+		if err := json.Unmarshal(lists, &items); err != nil {
+			return nil, err
+		}
+	}
+
+	out := make([]int, 0, len(items))
+	for _, l := range items {
+		if l.ID > 0 {
+			out = append(out, l.ID)
+		}
+	}
+	return out, nil
+}
+
+// SameIDSet reports whether two ID slices hold the same set of positive IDs,
+// ignoring order, duplicates and deleted-list zeros.
+func SameIDSet(a, b []int) bool {
+	set := func(ids []int) map[int]struct{} {
+		m := make(map[int]struct{}, len(ids))
+		for _, id := range ids {
+			if id > 0 {
+				m[id] = struct{}{}
+			}
+		}
+		return m
+	}
+
+	sa, sb := set(a), set(b)
+	if len(sa) != len(sb) {
+		return false
+	}
+	for id := range sa {
+		if _, ok := sb[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
 
 // QueryCampaigns retrieves paginated campaigns optionally filtering them by the given arbitrary
 // query expression. It also returns the total number of records in the DB.
