@@ -51,21 +51,17 @@ var (
 	reSlug        = regexp.MustCompile(`[^\p{L}\p{M}\p{N}]`)
 )
 
+// campaignReadScope returns the list scope shared by campaign reads and live statistics.
+func campaignReadScope(user auth.User) (bool, []int) {
+	if user.HasPerm(auth.PermCampaignsGetAll) {
+		return true, nil
+	}
+	return user.GetPermittedLists(auth.PermTypeGet | auth.PermTypeManage)
+}
+
 // GetCampaigns handles retrieval of campaigns.
 func (a *App) GetCampaigns(c echo.Context) error {
-	// Get the authenticated user.
-	user := auth.GetUser(c)
-
-	var (
-		hasAllPerm     = user.HasPerm(auth.PermCampaignsGetAll)
-		permittedLists []int
-	)
-
-	if !hasAllPerm {
-		// Either the user has campaigns:get_all permissions and can view all campaigns,
-		// or the campaigns are filtered by the lists the user has get|manage access to.
-		hasAllPerm, permittedLists = user.GetPermittedLists(auth.PermTypeGet | auth.PermTypeManage)
-	}
+	hasAllPerm, permittedLists := campaignReadScope(auth.GetUser(c))
 
 	var (
 		pg = a.pg.NewFromURL(c.Request().URL.Query())
@@ -485,7 +481,8 @@ func (a *App) DeleteCampaigns(c echo.Context) error {
 // GetRunningCampaignStats returns stats of a given set of campaign IDs.
 func (a *App) GetRunningCampaignStats(c echo.Context) error {
 	// Get the running campaign stats from the DB.
-	out, err := a.core.GetRunningCampaignStats()
+	all, listIDs := campaignReadScope(auth.GetUser(c))
+	out, err := a.core.GetRunningCampaignStats(all, listIDs)
 	if err != nil {
 		return err
 	}
@@ -874,7 +871,16 @@ func (a *App) GetRecipientEstimate(c echo.Context) error {
 
 	var count int64
 	if len(ids) > 0 {
-		if err := queries.GetRecipientEstimate.Get(&count, pq.Array(ids)); err != nil {
+		typ := c.QueryParam("type")
+		if typ == "" {
+			typ = models.CampaignTypeRegular
+		}
+		if typ != models.CampaignTypeRegular && typ != models.CampaignTypeOptin {
+			return echo.NewHTTPError(http.StatusBadRequest, "Unknown campaign type")
+		}
+		user := auth.GetUser(c)
+		all, permitted := user.GetPermittedLists(auth.PermTypeGet | auth.PermTypeManage)
+		if err := queries.GetRecipientEstimate.Get(&count, pq.Array(ids), typ, all, pq.Array(permitted)); err != nil {
 			a.log.Printf("error fetching recipient estimate: %v", err)
 			return echo.NewHTTPError(http.StatusInternalServerError,
 				a.i18n.Ts("globals.messages.errorFetching", "name", "{globals.terms.lists}", "error", err.Error()))

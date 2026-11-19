@@ -77,7 +77,10 @@ SELECT  c.*,
         SELECT COALESCE(SUM(m.subscriber_count), 0) FROM mat_list_subscriber_stats m
         JOIN lists ON lists.id = m.list_id
         WHERE m.list_id IN (SELECT list_id FROM campaign_lists WHERE campaign_lists.campaign_id = c.id)
-        AND (CASE WHEN lists.optin = 'double' THEN m.status = 'confirmed' ELSE m.status != 'unsubscribed' END)
+        AND ($5 OR m.list_id = ANY($6::INT[]))
+        AND CASE WHEN c.type = 'optin' THEN lists.optin = 'double' AND m.status = 'unconfirmed'
+                 WHEN lists.optin = 'double' THEN m.status = 'confirmed'
+                 ELSE m.status != 'unsubscribed' END
     ) AS est_recipients
 FROM campaigns c
 WHERE ($1 = 0 OR id = $1)
@@ -98,7 +101,10 @@ ORDER BY %order% OFFSET $7 LIMIT (CASE WHEN $8 < 1 THEN NULL ELSE $8 END);
 SELECT COALESCE(SUM(m.subscriber_count), 0) FROM mat_list_subscriber_stats m
     JOIN lists ON lists.id = m.list_id
     WHERE m.list_id = ANY($1::INT[])
-    AND (CASE WHEN lists.optin = 'double' THEN m.status = 'confirmed' ELSE m.status != 'unsubscribed' END);
+    AND ($3 OR m.list_id = ANY($4::INT[]))
+    AND CASE WHEN $2::campaign_type = 'optin' THEN lists.optin = 'double' AND m.status = 'unconfirmed'
+             WHEN lists.optin = 'double' THEN m.status = 'confirmed'
+             ELSE m.status != 'unsubscribed' END;
 
 -- name: get-campaign
 SELECT campaigns.*,
@@ -242,9 +248,10 @@ LEFT JOIN templates ON (templates.id = (CASE WHEN $2=0 THEN campaigns.template_i
 WHERE campaigns.id = $1;
 
 -- name: get-campaign-status
-SELECT id, status, to_send, sent, started_at, updated_at
-FROM campaigns
-WHERE status = $1;
+SELECT id, status, to_send, sent, started_at, updated_at, daily_limit, daily_sent, daily_window_start
+FROM campaigns WHERE status = $1 AND ($2 OR EXISTS (
+    SELECT 1 FROM campaign_lists WHERE campaign_id = campaigns.id AND list_id = ANY($3::INT[])
+));
 
 -- name: campaign-has-lists
 -- Returns TRUE if the campaign $1 has any of the lists given in $2.
@@ -270,7 +277,8 @@ WITH camps AS (
     AND NOT (
         campaigns.daily_limit > 0
         AND campaigns.daily_window_start IS NOT NULL
-        AND NOW() < campaigns.daily_window_start + INTERVAL '1 day'
+        AND NOW() < campaigns.daily_window_start + INTERVAL '24 hours'
+        AND campaigns.last_subscriber_id < campaigns.max_subscriber_id
         AND campaigns.daily_sent >= campaigns.daily_limit
     )
 ),
@@ -397,12 +405,12 @@ SELECT link_clicks.campaign_id,
 -- name: get-running-campaign
 -- Returns the metadata for a running campaign that is required by next-campaign-subscribers to retrieve
 -- a batch of campaign subscribers for processing.
-SELECT campaigns.id AS campaign_id, campaigns.type as campaign_type, last_subscriber_id, max_subscriber_id,
-    daily_limit, daily_sent, daily_window_start, lists.id AS list_id
-    FROM campaigns
-    JOIN campaign_lists ON (campaign_lists.campaign_id = campaigns.id)
-    JOIN lists ON (lists.id = campaign_lists.list_id)
-    WHERE campaigns.id = $1 AND campaigns.status='running';
+SELECT type, last_subscriber_id, max_subscriber_id, daily_limit,
+    ARRAY(SELECT list_id FROM campaign_lists WHERE campaign_id = campaigns.id AND list_id IS NOT NULL) AS list_ids,
+    CASE WHEN daily_window_start + INTERVAL '24 hours' > NOW() THEN daily_sent ELSE 0 END AS daily_sent,
+    CASE WHEN daily_window_start + INTERVAL '24 hours' > NOW() THEN daily_window_start ELSE NOW() END AS window_start
+FROM campaigns WHERE id = $1 AND status = 'running'
+FOR UPDATE;
 
 -- name: next-campaign-subscribers
 -- Returns a batch of subscribers in a given campaign starting from the last checkpoint
@@ -455,7 +463,10 @@ subs AS (
 ),
 u AS (
     UPDATE campaigns
-    SET last_subscriber_id = (SELECT MAX(id) FROM subs), updated_at = NOW()
+    SET last_subscriber_id = (SELECT MAX(id) FROM subs),
+        daily_sent = CASE WHEN daily_limit > 0 THEN $7::INT + (SELECT COUNT(*) FROM subs) ELSE daily_sent END,
+        daily_window_start = CASE WHEN daily_limit > 0 THEN $8::TIMESTAMPTZ ELSE daily_window_start END,
+        updated_at = NOW()
     WHERE (SELECT COUNT(id) FROM subs) > 0 AND id=$1
 )
 SELECT * FROM subs;
@@ -521,10 +532,6 @@ medi AS (
 INSERT INTO campaign_lists (campaign_id, list_id, list_name)
     (SELECT $1 as campaign_id, id, name FROM lists WHERE id=ANY($14::INT[]))
     ON CONFLICT (campaign_id, list_id) DO UPDATE SET list_name = EXCLUDED.list_name;
-
--- name: update-campaign-daily-sent
--- Records the number of messages queued in the current daily window of a campaign.
-UPDATE campaigns SET daily_window_start=$2, daily_sent=$3 WHERE id=$1;
 
 -- name: update-campaign-counts
 UPDATE campaigns SET

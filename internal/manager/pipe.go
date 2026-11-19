@@ -1,7 +1,6 @@
 package manager
 
 import (
-	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -12,14 +11,15 @@ import (
 )
 
 type pipe struct {
-	camp       *models.Campaign
-	rate       *ratecounter.RateCounter
-	wg         *sync.WaitGroup
-	sent       atomic.Int64
-	lastID     atomic.Uint64
-	errors     atomic.Uint64
-	stopped    atomic.Bool
-	withErrors atomic.Bool
+	camp             *models.Campaign
+	rate             *ratecounter.RateCounter
+	wg               *sync.WaitGroup
+	sent             atomic.Int64
+	lastID           atomic.Uint64
+	errors           atomic.Uint64
+	stopped          atomic.Bool
+	withErrors       atomic.Bool
+	waitingForWindow atomic.Bool
 
 	m *Manager
 }
@@ -83,9 +83,6 @@ func (p *pipe) NextSubscribers() (bool, error) {
 	// Fetch the next batch of subscribers from a 'running' campaign.
 	subs, err := p.m.store.NextSubscribers(p.camp.ID, p.m.cfg.BatchSize)
 	if err != nil {
-		if errors.Is(err, ErrDailyLimitReached) {
-			return false, err
-		}
 		return false, fmt.Errorf("error fetching campaign subscribers (%s): %w", p.camp.Name, err)
 	}
 
@@ -201,7 +198,12 @@ func (p *pipe) cleanup() {
 	}()
 
 	// Update campaign's 'sent count.
-	if err := p.m.store.UpdateCampaignCounts(p.camp.ID, 0, int(p.sent.Load()), int(p.lastID.Load())); err != nil {
+	lastID := int(p.lastID.Load())
+	if p.waitingForWindow.Load() && !p.stopped.Load() {
+		// All reservations drained. Keep the database cursor, including skipped/failed messages.
+		lastID = 0
+	}
+	if err := p.m.store.UpdateCampaignCounts(p.camp.ID, 0, int(p.sent.Swap(0)), lastID); err != nil {
 		p.m.log.Printf("error updating campaign counts (%s): %v", p.camp.Name, err)
 	}
 
@@ -214,6 +216,11 @@ func (p *pipe) cleanup() {
 		}
 
 		_ = p.m.sendNotif(p.camp, models.CampaignStatusPaused, "Too many errors")
+		return
+	}
+
+	// Leave a window-limited campaign running for the scanner to resume.
+	if p.waitingForWindow.Load() {
 		return
 	}
 

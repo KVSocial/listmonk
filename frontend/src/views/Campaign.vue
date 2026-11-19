@@ -144,7 +144,7 @@
 
                 <b-field :label="$t('campaigns.dailyLimit')" label-position="on-border" class="mt-4"
                   :message="dailyLimitMessage" data-cy="daily-limit">
-                  <b-numberinput v-model="form.dailyLimit" :disabled="!canEdit" :min="0" :step="100"
+                  <b-numberinput v-model="form.dailyLimit" :disabled="!canEdit" :min="0" :step="1"
                     :controls="false" name="daily_limit" placeholder="0" expanded />
                 </b-field>
 
@@ -453,22 +453,6 @@ export default Vue.extend({
       this.form.media.push(o);
     },
 
-    // Fetch the approximate recipient count for the selected lists (debounced).
-    fetchRecipientEstimate() {
-      clearTimeout(this.estTimer);
-      const ids = this.form.lists.map((l) => l.id);
-      if (ids.length === 0) {
-        this.estRecipients = null;
-        return;
-      }
-
-      this.estTimer = setTimeout(() => {
-        this.$api.getRecipientEstimate(ids).then((d) => {
-          this.estRecipients = d.count;
-        });
-      }, 300);
-    },
-
     isUnsaved() {
       return this.data.body !== this.form.content.body
         || this.data.contentType !== this.form.content.contentType;
@@ -761,6 +745,10 @@ export default Vue.extend({
       return this.lists.results.filter((l) => this.selListIDs.indexOf(l.id) > -1);
     },
 
+    estimateParams() {
+      return { ids: this.form.lists.map((l) => l.id), type: this.form.type || 'regular' };
+    },
+
     // Help text for the daily limit, with how many days sending will take.
     dailyLimitMessage() {
       const help = this.$t('campaigns.dailyLimitHelp');
@@ -794,8 +782,18 @@ export default Vue.extend({
   },
 
   watch: {
-    'form.lists': function onLists() {
-      this.fetchRecipientEstimate();
+    estimateParams(params) {
+      clearTimeout(this.estTimer);
+      this.estRecipients = null;
+      if (params.ids.length) {
+        this.estTimer = setTimeout(() => {
+          this.$api.getRecipientEstimate(params.ids, params.type).then((data) => {
+            if (params === this.estimateParams) {
+              this.estRecipients = data.count;
+            }
+          }).catch(() => { /* The API interceptor reports the error. */ });
+        }, 300);
+      }
     },
 
     selectedLists() {
@@ -877,6 +875,7 @@ export default Vue.extend({
   },
 
   beforeDestroy() {
+    clearTimeout(this.estTimer);
     this.$events.$off('campaign.update');
   },
 });

@@ -1,15 +1,12 @@
 package main
 
 import (
-	"time"
-
 	"github.com/gofrs/uuid/v5"
 	"github.com/knadh/listmonk/internal/core"
 	"github.com/knadh/listmonk/internal/manager"
 	"github.com/knadh/listmonk/internal/media"
 	"github.com/knadh/listmonk/models"
 	"github.com/lib/pq"
-	null "gopkg.in/volatiletech/null.v6"
 )
 
 // store implements DataSource over the primary
@@ -18,17 +15,6 @@ type store struct {
 	queries *models.Queries
 	core    *core.Core
 	media   media.Store
-}
-
-type runningCamp struct {
-	CampaignID       int    `db:"campaign_id"`
-	CampaignType     string `db:"campaign_type"`
-	LastSubscriberID int    `db:"last_subscriber_id"`
-	MaxSubscriberID  int       `db:"max_subscriber_id"`
-	DailyLimit       int       `db:"daily_limit"`
-	DailySent        int       `db:"daily_sent"`
-	DailyWindowStart null.Time `db:"daily_window_start"`
-	ListID           int       `db:"list_id"`
 }
 
 func newManagerStore(q *models.Queries, c *core.Core, m media.Store) *store {
@@ -53,57 +39,11 @@ func (s *store) NextCampaigns(currentIDs []int64, sentCounts []int64) ([]*models
 // and every batch takes the last ID of the last batch and fetches the next
 // batch above that.
 func (s *store) NextSubscribers(campID, limit int) ([]models.Subscriber, error) {
-	var camps []runningCamp
-	if err := s.queries.GetRunningCampaign.Select(&camps, campID); err != nil {
-		return nil, err
+	subs, atLimit, err := s.core.ReserveCampaignSubscribers(campID, limit)
+	if atLimit {
+		return nil, manager.ErrDailyLimitReached
 	}
-
-	var listIDs []int
-	for _, c := range camps {
-		listIDs = append(listIDs, c.ListID)
-	}
-
-	if len(listIDs) == 0 {
-		return nil, nil
-	}
-
-	c := camps[0]
-
-	// If the campaign has a daily send limit, cap the batch to what's left in the
-	// current 24h window. A window starts with the first batch fetched after the
-	// previous window expired, so sending resumes at the same time the next day.
-	var (
-		winStart = c.DailyWindowStart.Time
-		winSent  = c.DailySent
-	)
-	if c.DailyLimit > 0 {
-		if !c.DailyWindowStart.Valid || time.Since(winStart) >= 24*time.Hour {
-			winStart = time.Now()
-			winSent = 0
-		}
-
-		remaining := c.DailyLimit - winSent
-		if remaining <= 0 {
-			return nil, manager.ErrDailyLimitReached
-		}
-		if limit > remaining {
-			limit = remaining
-		}
-	}
-
-	var out []models.Subscriber
-	if err := s.queries.NextCampaignSubscribers.Select(&out, c.CampaignID, c.CampaignType, c.LastSubscriberID, c.MaxSubscriberID, pq.Array(listIDs), limit); err != nil {
-		return nil, err
-	}
-
-	if c.DailyLimit > 0 && len(out) > 0 {
-		// The subscriber checkpoint has already advanced, so don't fail the batch.
-		if _, err := s.queries.UpdateCampaignDailySent.Exec(c.CampaignID, winStart, winSent+len(out)); err != nil {
-			lo.Printf("error updating daily sent count for campaign %d: %v", c.CampaignID, err)
-		}
-	}
-
-	return out, nil
+	return subs, err
 }
 
 // GetCampaign fetches a campaign from the database.

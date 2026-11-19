@@ -301,14 +301,14 @@ func (m *Manager) Run() {
 		has, err := p.NextSubscribers()
 		if err != nil {
 			if errors.Is(err, ErrDailyLimitReached) {
+				p.waitingForWindow.Store(true)
 				m.log.Printf("campaign (%s) reached its daily limit of %d. Resuming in the next window.", p.camp.Name, p.camp.DailyLimit)
 			} else {
+				p.Stop(false)
 				m.log.Printf("error processing campaign batch (%s): %v", p.camp.Name, err)
 			}
 
-			// If the batch fails, stop the pipe and release it so that it doesn't hang forever.
-			// The cleanup() records the state in DB and scanCampaigns() picks it up at a later point.
-			p.Stop(false)
+			// Release the producer. At the daily limit workers still deliver queued mail.
 			p.wg.Done()
 			continue
 		}
@@ -559,9 +559,6 @@ func (m *Manager) worker() {
 
 			// Increment the send rate or the error counter if there was an error.
 			if msg.pipe != nil {
-				// Mark the message as done.
-				msg.pipe.wg.Done()
-
 				if err != nil {
 					// Call the error callback, which keeps track of the error count
 					// and stops the campaign if the error count exceeds the threshold.
@@ -574,6 +571,8 @@ func (m *Manager) worker() {
 					msg.pipe.rate.Incr(1)
 					msg.pipe.sent.Add(1)
 				}
+				// Cleanup must see the outcome of the last queued message.
+				msg.pipe.wg.Done()
 			}
 
 		// Arbitrary message.
@@ -606,8 +605,7 @@ func (m *Manager) getCurrentCampaigns() ([]int64, []int64) {
 
 		// Get the sent counts for campaigns and reset them to 0
 		// as in the database, they're stored cumulatively (sent += $newSent).
-		counts = append(counts, p.sent.Load())
-		p.sent.Store(0)
+		counts = append(counts, p.sent.Swap(0))
 	}
 
 	return ids, counts
