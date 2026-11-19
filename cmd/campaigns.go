@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/knadh/listmonk/internal/auth"
+	"github.com/knadh/listmonk/internal/core"
 	"github.com/knadh/listmonk/internal/notifs"
 	"github.com/knadh/listmonk/models"
 	"github.com/labstack/echo/v4"
@@ -51,21 +52,17 @@ var (
 	reSlug        = regexp.MustCompile(`[^\p{L}\p{M}\p{N}]`)
 )
 
+// campaignReadScope returns the list scope shared by campaign reads and live statistics.
+func campaignReadScope(user auth.User) (bool, []int) {
+	if user.HasPerm(auth.PermCampaignsGetAll) {
+		return true, nil
+	}
+	return user.GetPermittedLists(auth.PermTypeGet | auth.PermTypeManage)
+}
+
 // GetCampaigns handles retrieval of campaigns.
 func (a *App) GetCampaigns(c echo.Context) error {
-	// Get the authenticated user.
-	user := auth.GetUser(c)
-
-	var (
-		hasAllPerm     = user.HasPerm(auth.PermCampaignsGetAll)
-		permittedLists []int
-	)
-
-	if !hasAllPerm {
-		// Either the user has campaigns:get_all permissions and can view all campaigns,
-		// or the campaigns are filtered by the lists the user has get|manage access to.
-		hasAllPerm, permittedLists = user.GetPermittedLists(auth.PermTypeGet | auth.PermTypeManage)
-	}
+	hasAllPerm, permittedLists := campaignReadScope(auth.GetUser(c))
 
 	var (
 		pg = a.pg.NewFromURL(c.Request().URL.Query())
@@ -332,7 +329,27 @@ func (a *App) UpdateCampaign(c echo.Context) error {
 
 	// Filter lists against the current user's permitted lists.
 	user := auth.GetUser(c)
-	o.ListIDs = user.FilterListsByPerm(auth.PermTypeGet|auth.PermTypeManage, o.ListIDs)
+	if cm.StartedAt.Valid {
+		// A started campaign's audience was frozen when it began sending, so its
+		// lists can no longer change. Compare only the lists this user can see,
+		// then keep the stored set as is.
+		curIDs, err := core.CampaignListIDs(cm.Lists)
+		if err != nil {
+			a.log.Printf("error reading lists of campaign %d: %v", id, err)
+			return echo.NewHTTPError(http.StatusInternalServerError,
+				a.i18n.Ts("globals.messages.errorFetching", "name", "{globals.terms.lists}", "error", err.Error()))
+		}
+		if o.ListIDs != nil {
+			want := user.FilterListsByPerm(auth.PermTypeGet|auth.PermTypeManage, o.ListIDs)
+			have := user.FilterListsByPerm(auth.PermTypeGet|auth.PermTypeManage, curIDs)
+			if !core.SameIDSet(want, have) {
+				return echo.NewHTTPError(http.StatusBadRequest, a.i18n.T("campaigns.cantChangeListsStarted"))
+			}
+		}
+		o.ListIDs = curIDs
+	} else {
+		o.ListIDs = user.FilterListsByPerm(auth.PermTypeGet|auth.PermTypeManage, o.ListIDs)
+	}
 
 	if c, err := a.validateCampaignFields(o); err != nil {
 		return echo.NewHTTPError(http.StatusBadRequest, err.Error())
@@ -485,7 +502,8 @@ func (a *App) DeleteCampaigns(c echo.Context) error {
 // GetRunningCampaignStats returns stats of a given set of campaign IDs.
 func (a *App) GetRunningCampaignStats(c echo.Context) error {
 	// Get the running campaign stats from the DB.
-	out, err := a.core.GetRunningCampaignStats()
+	all, listIDs := campaignReadScope(auth.GetUser(c))
+	out, err := a.core.GetRunningCampaignStats(all, listIDs)
 	if err != nil {
 		return err
 	}
@@ -729,6 +747,10 @@ func (a *App) validateCampaignFields(c campReq) (campReq, error) {
 		return c, errors.New(a.i18n.T("campaigns.fieldInvalidListIDs"))
 	}
 
+	if c.DailyLimit < 0 {
+		c.DailyLimit = 0
+	}
+
 	if !a.manager.HasMessenger(c.Messenger) {
 		// If it's a specific SMTP, but it's no longer available (removed/disabled), fall back to general email messenger.
 		if strings.HasPrefix(c.Messenger, "email-") {
@@ -858,4 +880,35 @@ func canEditCampaign(status string) bool {
 	return status == models.CampaignStatusDraft ||
 		status == models.CampaignStatusPaused ||
 		status == models.CampaignStatusScheduled
+}
+
+// GetRecipientEstimate returns an approximate number of recipients for the
+// given list IDs (?list_id=1&list_id=2) based on the cached list stats.
+func (a *App) GetRecipientEstimate(c echo.Context) error {
+	ids, err := parseStringIDs(c.Request().URL.Query()["list_id"])
+	if err != nil {
+		return echo.NewHTTPError(http.StatusBadRequest, a.i18n.Ts("globals.messages.invalidID", "error", err.Error()))
+	}
+
+	var count int64
+	if len(ids) > 0 {
+		typ := c.QueryParam("type")
+		if typ == "" {
+			typ = models.CampaignTypeRegular
+		}
+		if typ != models.CampaignTypeRegular && typ != models.CampaignTypeOptin {
+			return echo.NewHTTPError(http.StatusBadRequest, "Unknown campaign type")
+		}
+		user := auth.GetUser(c)
+		all, permitted := user.GetPermittedLists(auth.PermTypeGet | auth.PermTypeManage)
+		if err := queries.GetRecipientEstimate.Get(&count, pq.Array(ids), typ, all, pq.Array(permitted)); err != nil {
+			a.log.Printf("error fetching recipient estimate: %v", err)
+			return echo.NewHTTPError(http.StatusInternalServerError,
+				a.i18n.Ts("globals.messages.errorFetching", "name", "{globals.terms.lists}", "error", err.Error()))
+		}
+	}
+
+	return c.JSON(http.StatusOK, okResp{struct {
+		Count int64 `json:"count"`
+	}{count}})
 }

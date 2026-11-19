@@ -282,6 +282,11 @@ export const getBounces = async (params) => http.get(
 );
 
 // Campaigns.
+export const getRecipientEstimate = async (listIDs, type = 'regular') => http.get(
+  '/api/campaigns/estimate',
+  { params: { list_id: listIDs, type } },
+);
+
 export const getCampaigns = async (params) => http.get('/api/campaigns', {
   params,
   loading: models.campaigns,

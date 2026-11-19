@@ -78,8 +78,17 @@
                     :placeholder="$t('campaigns.fromAddressPlaceholder')" required />
                 </b-field>
 
-                <list-selector v-model="form.lists" :selected="form.lists" :all="lists.results" :disabled="!canEdit"
-                  :label="$t('globals.terms.lists')" :placeholder="$t('campaigns.sendToLists')" />
+                <list-selector v-model="form.lists" :selected="form.lists" :all="lists.results"
+                  :disabled="!canEdit || hasStarted" :label="$t('globals.terms.lists')"
+                  :placeholder="$t('campaigns.sendToLists')" />
+                <p v-if="canEdit && hasStarted" class="is-size-7 has-text-grey mb-2" data-cy="lists-locked">
+                  {{ $t('campaigns.listsLockedStarted') }}
+                </p>
+                <p v-if="form.lists.length > 0 && estRecipients !== null" class="is-size-7 has-text-grey mb-4"
+                  data-cy="recipient-estimate">
+                  <b-icon icon="account-multiple-outline" size="is-small" />
+                  {{ $t('campaigns.recipientEstimate', { num: $utils.formatNumber(estRecipients) }) }}
+                </p>
 
                 <div class="columns">
                   <div class="column is-6">
@@ -136,6 +145,12 @@
                     </b-field>
                   </div>
                 </div>
+
+                <b-field :label="$t('campaigns.dailyLimit')" label-position="on-border" class="mt-4"
+                  :message="dailyLimitMessage" data-cy="daily-limit">
+                  <b-numberinput v-model="form.dailyLimit" :disabled="!canEdit" :min="0" :step="1"
+                    :controls="false" name="daily_limit" placeholder="0" expanded />
+                </b-field>
 
                 <div>
                   <p class="has-text-right">
@@ -393,7 +408,12 @@ export default Vue.extend({
         archiveMetaStr: '{}',
         archiveMeta: {},
         testEmails: [],
+        dailyLimit: 0,
       },
+
+      // Approximate recipient count for the selected lists.
+      estRecipients: null,
+      estTimer: null,
     };
   },
 
@@ -580,6 +600,7 @@ export default Vue.extend({
         headers: this.form.headers,
         attribs: this.form.attribs,
         media: this.form.media.map((m) => m.id),
+        daily_limit: Number(this.form.dailyLimit) || 0,
       };
 
       this.$api.createCampaign(data).then((d) => {
@@ -610,6 +631,7 @@ export default Vue.extend({
         archive_template_id: this.form.archiveTemplateId,
         archive_meta: this.form.archiveMeta,
         media: this.form.media.map((m) => m.id),
+        daily_limit: Number(this.form.dailyLimit) || 0,
       };
 
       let typMsg = 'globals.messages.updated';
@@ -703,6 +725,11 @@ export default Vue.extend({
         || this.data.status === 'draft' || this.data.status === 'scheduled' || this.data.status === 'paused';
     },
 
+    // A campaign's audience is frozen once it starts sending, so its lists are locked.
+    hasStarted() {
+      return !this.isNew && !!this.data.startedAt;
+    },
+
     canSchedule() {
       return (this.data.status === 'draft' || this.data.status === 'paused') && (this.form.sendLater && this.form.sendAtDate);
     },
@@ -727,6 +754,25 @@ export default Vue.extend({
       return this.lists.results.filter((l) => this.selListIDs.indexOf(l.id) > -1);
     },
 
+    estimateParams() {
+      return { ids: this.form.lists.map((l) => l.id), type: this.form.type || 'regular' };
+    },
+
+    // Help text for the daily limit, with how many days sending will take.
+    dailyLimitMessage() {
+      const help = this.$t('campaigns.dailyLimitHelp');
+      const limit = Number(this.form.dailyLimit) || 0;
+      if (limit <= 0 || !this.estRecipients) {
+        return help;
+      }
+
+      const days = this.$t('campaigns.dailyLimitDays', {
+        num: this.$utils.formatNumber(limit),
+        days: Math.ceil(this.estRecipients / limit),
+      });
+      return `${days} ${help}`;
+    },
+
     emailMessengers() {
       return ['email', ...this.serverConfig.messengers.filter((m) => m.startsWith('email-'))];
     },
@@ -745,6 +791,20 @@ export default Vue.extend({
   },
 
   watch: {
+    estimateParams(params) {
+      clearTimeout(this.estTimer);
+      this.estRecipients = null;
+      if (params.ids.length) {
+        this.estTimer = setTimeout(() => {
+          this.$api.getRecipientEstimate(params.ids, params.type).then((data) => {
+            if (params === this.estimateParams) {
+              this.estRecipients = data.count;
+            }
+          }).catch(() => { /* The API interceptor reports the error. */ });
+        }, 300);
+      }
+    },
+
     selectedLists() {
       this.form.lists = this.selectedLists;
     },
@@ -824,6 +884,7 @@ export default Vue.extend({
   },
 
   beforeDestroy() {
+    clearTimeout(this.estTimer);
     this.$events.$off('campaign.update');
   },
 });

@@ -270,6 +270,7 @@ func installCampaign(campTplID, archiveTplID int, q *models.Queries) {
 		`{"name": "Subscriber"}`,
 		nil,
 		nil,
+		0, // daily_limit
 	); err != nil {
 		lo.Fatalf("error creating sample campaign: %v", err)
 	}

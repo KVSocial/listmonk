@@ -25,7 +25,7 @@ WITH tpl AS (
 camp AS (
     INSERT INTO campaigns (uuid, type, name, subject, from_email, body, altbody,
         content_type, send_at, headers, attribs, tags, messenger, template_id, to_send,
-        max_subscriber_id, archive, archive_slug, archive_template_id, archive_meta, body_source)
+        max_subscriber_id, archive, archive_slug, archive_template_id, archive_meta, body_source, daily_limit)
         SELECT $1, $2, $3, $4, $5,
             -- body
             COALESCE(NULLIF($6, ''), (SELECT body FROM tpl), ''),
@@ -40,7 +40,9 @@ camp AS (
             $18,
             $19,
             -- body_source
-            COALESCE($21, (SELECT body_source FROM tpl))
+            COALESCE($21, (SELECT body_source FROM tpl)),
+            -- daily_limit
+            GREATEST(COALESCE($22::INT, 0), 0)
         RETURNING id
 ),
 med AS (
@@ -68,7 +70,18 @@ SELECT  c.*,
                 campaign_lists.list_name AS name
                 FROM campaign_lists WHERE campaign_lists.campaign_id = c.id
         ) l
-    ) AS lists
+    ) AS lists,
+    -- Approximate recipient count from the cached list stats (may count a
+    -- subscriber once per list they're on).
+    (
+        SELECT COALESCE(SUM(m.sendable_count), 0) FROM mat_list_subscriber_stats m
+        JOIN lists ON lists.id = m.list_id
+        WHERE m.list_id IN (SELECT list_id FROM campaign_lists WHERE campaign_lists.campaign_id = c.id)
+        AND ($5 OR m.list_id = ANY($6::INT[]))
+        AND CASE WHEN c.type = 'optin' THEN lists.optin = 'double' AND m.status = 'unconfirmed'
+                 WHEN lists.optin = 'double' THEN m.status = 'confirmed'
+                 ELSE m.status != 'unsubscribed' END
+    ) AS est_recipients
 FROM campaigns c
 WHERE ($1 = 0 OR id = $1)
     AND (CARDINALITY($2::campaign_status[]) = 0 OR status = ANY($2))
@@ -81,6 +94,17 @@ WHERE ($1 = 0 OR id = $1)
         )
     )
 ORDER BY %order% OFFSET $7 LIMIT (CASE WHEN $8 < 1 THEN NULL ELSE $8 END);
+
+-- name: get-recipient-estimate
+-- Returns an approximate recipient count for a set of lists from the cached list
+-- stats. A subscriber on multiple lists is counted once per list.
+SELECT COALESCE(SUM(m.sendable_count), 0) FROM mat_list_subscriber_stats m
+    JOIN lists ON lists.id = m.list_id
+    WHERE m.list_id = ANY($1::INT[])
+    AND ($3 OR m.list_id = ANY($4::INT[]))
+    AND CASE WHEN $2::campaign_type = 'optin' THEN lists.optin = 'double' AND m.status = 'unconfirmed'
+             WHEN lists.optin = 'double' THEN m.status = 'confirmed'
+             ELSE m.status != 'unsubscribed' END;
 
 -- name: get-campaign
 SELECT campaigns.*,
@@ -224,9 +248,10 @@ LEFT JOIN templates ON (templates.id = (CASE WHEN $2=0 THEN campaigns.template_i
 WHERE campaigns.id = $1;
 
 -- name: get-campaign-status
-SELECT id, status, to_send, sent, started_at, updated_at
-FROM campaigns
-WHERE status = $1;
+SELECT id, status, to_send, sent, started_at, updated_at, daily_limit, daily_sent, daily_window_start
+FROM campaigns WHERE status = $1 AND ($2 OR EXISTS (
+    SELECT 1 FROM campaign_lists WHERE campaign_id = campaigns.id AND list_id = ANY($3::INT[])
+));
 
 -- name: campaign-has-lists
 -- Returns TRUE if the campaign $1 has any of the lists given in $2.
@@ -235,12 +260,8 @@ SELECT EXISTS (
 );
 
 -- name: next-campaigns
--- Retreives campaigns that are running (or scheduled and the time's up) and need
--- to be processed. It updates the to_send count and max_subscriber_id of the campaign,
--- that is, the total number of subscribers to be processed across all lists of a campaign.
--- Thus, it has a sideaffect.
--- In addition, it finds the max_subscriber_id, the upper limit across all lists of
--- a campaign. This is used to fetch and slice subscribers for the campaign in next-campaign-subscribers.
+-- Freeze the eligible IDs when the scanner starts a campaign. Resumes reuse the
+-- remaining rows. For campaigns started before the upgrade, retain the old ID bounds.
 WITH camps AS (
     -- Get all running campaigns and their template bodies (if the template's deleted, the default template body instead)
     SELECT campaigns.*, COALESCE(templates.body, (SELECT body FROM templates WHERE is_default = true LIMIT 1), '') AS template_body
@@ -248,12 +269,15 @@ WITH camps AS (
     LEFT JOIN templates ON (templates.id = campaigns.template_id)
     WHERE (status='running' OR (status='scheduled' AND NOW() >= campaigns.send_at))
     AND NOT(campaigns.id = ANY($1::INT[]))
-),
-campLists AS (
-    -- Get the list_ids and their optin statuses for the campaigns found in the previous step.
-    SELECT lists.id AS list_id, campaign_id, optin FROM lists
-    INNER JOIN campaign_lists ON (campaign_lists.list_id = lists.id)
-    WHERE campaign_lists.campaign_id = ANY(SELECT id FROM camps)
+    -- Skip campaigns that have exhausted their daily send limit in the current 24h window.
+    AND NOT (
+        campaigns.daily_limit > 0
+        AND campaigns.daily_window_start IS NOT NULL
+        AND NOW() < campaigns.daily_window_start + INTERVAL '24 hours'
+        AND EXISTS (SELECT 1 FROM campaign_pending_recipients WHERE campaign_id = campaigns.id)
+        AND campaigns.daily_sent >= campaigns.daily_limit
+    )
+    FOR UPDATE OF campaigns
 ),
 campMedia AS (
     -- Get the list_ids and their optin statuses for the campaigns found in the previous step.
@@ -261,20 +285,16 @@ campMedia AS (
     WHERE campaign_id = ANY(SELECT id FROM camps) AND media_id IS NOT NULL
     GROUP BY campaign_id
 ),
+snapshot AS (
+    INSERT INTO campaign_pending_recipients (campaign_id, subscriber_id)
+    SELECT DISTINCT c.id, e.subscriber_id
+    FROM camps c JOIN campaign_eligible_subscribers e ON e.campaign_id = c.id
+    WHERE NOT c.audience_frozen AND (c.started_at IS NULL OR
+          (e.subscriber_id > c.last_subscriber_id AND e.subscriber_id <= c.max_subscriber_id))
+    RETURNING campaign_id, subscriber_id
+),
 counts AS (
-    SELECT camps.id AS campaign_id, COUNT(DISTINCT sl.subscriber_id) AS to_send, COALESCE(MAX(sl.subscriber_id), 0) AS max_subscriber_id
-    FROM camps
-    JOIN campLists cl ON cl.campaign_id = camps.id
-    JOIN subscriber_lists sl ON sl.list_id = cl.list_id
-        AND (
-            CASE
-                WHEN camps.type = 'optin' THEN sl.status = 'unconfirmed' AND cl.optin = 'double'
-                WHEN cl.optin = 'double' THEN sl.status = 'confirmed'
-                ELSE sl.status != 'unsubscribed'
-            END
-        )
-    JOIN subscribers s ON (s.id = sl.subscriber_id AND s.status != 'blocklisted')
-    GROUP BY camps.id
+    SELECT campaign_id, COUNT(*) AS total, MAX(subscriber_id) AS max_id FROM snapshot GROUP BY campaign_id
 ),
 updateCounts AS (
     WITH uc (campaign_id, sent_count) AS (SELECT * FROM unnest($1::INT[], $2::INT[]))
@@ -283,14 +303,12 @@ updateCounts AS (
     FROM uc WHERE campaigns.id = uc.campaign_id
 ),
 u AS (
-    -- For each campaign, update the to_send count and set the max_subscriber_id.
-    UPDATE campaigns AS ca
-    SET to_send = co.to_send,
-        status = (CASE WHEN status != 'running' THEN 'running' ELSE status END),
-        max_subscriber_id = co.max_subscriber_id,
-        started_at=(CASE WHEN ca.started_at IS NULL THEN NOW() ELSE ca.started_at END)
-    FROM (SELECT * FROM counts) co
-    WHERE ca.id = co.campaign_id
+    UPDATE campaigns ca
+    SET to_send = CASE WHEN c.started_at IS NULL THEN COALESCE(co.total, 0) ELSE c.to_send END,
+        max_subscriber_id = CASE WHEN c.started_at IS NULL THEN COALESCE(co.max_id, 0) ELSE c.max_subscriber_id END,
+        status = 'running', audience_frozen = true, started_at = COALESCE(c.started_at, NOW())
+    FROM camps c LEFT JOIN counts co ON co.campaign_id = c.id
+    WHERE ca.id = c.id AND (NOT c.audience_frozen OR c.status != 'running')
 )
 SELECT camps.*, campMedia.media_id FROM camps LEFT JOIN campMedia ON (campMedia.campaign_id = camps.id);
 
@@ -369,70 +387,40 @@ SELECT link_clicks.campaign_id,
     WHERE link_clicks.created_at >= $1
     ORDER BY link_clicks.id ASC LIMIT $2 OFFSET $3;
 
--- name: get-running-campaign
--- Returns the metadata for a running campaign that is required by next-campaign-subscribers to retrieve
--- a batch of campaign subscribers for processing.
-SELECT campaigns.id AS campaign_id, campaigns.type as campaign_type, last_subscriber_id, max_subscriber_id, lists.id AS list_id
-    FROM campaigns
-    JOIN campaign_lists ON (campaign_lists.campaign_id = campaigns.id)
-    JOIN lists ON (lists.id = campaign_lists.list_id)
-    WHERE campaigns.id = $1 AND campaigns.status='running';
-
 -- name: next-campaign-subscribers
--- Returns a batch of subscribers in a given campaign starting from the last checkpoint
--- (last_subscriber_id). Every fetch updates the checkpoint and the sent count, which means
--- every fetch returns a new batch of subscribers until all rows are exhausted.
---
--- In previous versions, get-running-campaign + this was a single query spread across multiple
--- CTEs, but despite numerous permutations and combinations, Postgres query planner simply would not use
--- the right indexes on subscriber_lists when the JOIN or ids were referenced dynamically from campLists
--- (be it a CTE or various kinds of joins). However, statically providing the list IDs to JOIN on ($5::INT[])
--- the query planner works as expected. The difference is staggering. ~15 seconds on a subscribers table with 15m
--- rows and a subscriber_lists table with 70 million rows when fetching subscribers for a campaign with a single list,
--- vs. a few million seconds using this current approach.
-WITH campLists AS (
-    SELECT lists.id AS list_id, optin FROM lists
-    LEFT JOIN campaign_lists ON campaign_lists.list_id = lists.id
-    WHERE campaign_lists.campaign_id = $1
-),
-subs AS (
-    SELECT s.*
-    FROM (
-        SELECT DISTINCT s.id
-        FROM subscriber_lists sl
-        JOIN campLists ON sl.list_id = campLists.list_id
-        JOIN subscribers s ON s.id = sl.subscriber_id
-        WHERE
-            sl.list_id = ANY($5::INT[])
-            -- last_subscriber_id
-            AND s.id > $3
-             -- max_subscriber_id
-            AND s.id <= $4
-             -- Subscriber should not be blacklisted.
-            AND s.status != 'blocklisted'
-            AND (
-                -- If it's an optin campaign and the list is double-optin, only pick unconfirmed subscribers.
-                ($2 = 'optin' AND sl.status = 'unconfirmed' AND campLists.optin = 'double')
-                OR (
-                    -- It is a regular campaign.
-                    $2 != 'optin' AND (
-                        -- It is a double optin list. Only pick confirmed subscribers.
-                        (campLists.optin = 'double' AND sl.status = 'confirmed') OR
+-- Paging only advances the pipe's in-memory cursor. Every unattempted ID stays durable.
+SELECT s.* FROM campaign_pending_recipients p JOIN subscribers s ON s.id = p.subscriber_id
+WHERE p.campaign_id = $1 AND p.subscriber_id > $2
+ORDER BY p.subscriber_id LIMIT $3;
 
-                        -- It is a single optin list. Pick all non-unsubscribed subscribers.
-                        (campLists.optin != 'double' AND sl.status != 'unsubscribed')
-                    )
-                )
-            )
-        ORDER BY s.id LIMIT $6
-    ) subIDs JOIN subscribers s ON (s.id = subIDs.id) ORDER BY s.id
+-- name: claim-campaign-recipient
+-- Serialize claims for a campaign, including pause/resume and daily-window changes.
+-- Remove an ineligible recipient without charging it. A limited or paused recipient stays pending.
+WITH camp AS (
+    SELECT id, status, daily_limit,
+        CASE WHEN daily_window_start + INTERVAL '24 hours' > NOW() THEN daily_sent ELSE 0 END AS used,
+        CASE WHEN daily_window_start + INTERVAL '24 hours' > NOW() THEN daily_window_start ELSE NOW() END AS window_start
+    FROM campaigns WHERE id = $1 FOR UPDATE
 ),
-u AS (
-    UPDATE campaigns
-    SET last_subscriber_id = (SELECT MAX(id) FROM subs), updated_at = NOW()
-    WHERE (SELECT COUNT(id) FROM subs) > 0 AND id=$1
+decision AS (
+    SELECT CASE
+        WHEN status != 'running' THEN 'inactive'
+        WHEN NOT EXISTS (SELECT 1 FROM campaign_eligible_subscribers WHERE campaign_id = $1 AND subscriber_id = $2) THEN 'skip'
+        WHEN daily_limit > 0 AND used >= daily_limit THEN 'limited'
+        ELSE 'attempt' END AS action
+    FROM camp
+),
+claimed AS (
+    DELETE FROM campaign_pending_recipients WHERE campaign_id = $1 AND subscriber_id = $2
+        AND (SELECT action FROM decision) IN ('skip', 'attempt') RETURNING subscriber_id
+),
+charge AS (
+    UPDATE campaigns c SET daily_sent = camp.used + 1, daily_window_start = camp.window_start
+    FROM camp WHERE c.id = camp.id AND camp.daily_limit > 0
+        AND EXISTS (SELECT 1 FROM claimed) AND (SELECT action FROM decision) = 'attempt'
 )
-SELECT * FROM subs;
+SELECT CASE WHEN action = 'attempt' AND NOT EXISTS (SELECT 1 FROM claimed) THEN 'skip' ELSE action END
+FROM decision;
 
 -- name: delete-campaign-views
 DELETE FROM campaign_views WHERE created_at < $1;
@@ -475,6 +463,7 @@ WITH camp AS (
         archive_template_id=(CASE WHEN $7::content_type = 'visual' THEN NULL ELSE $17::INT END),
         archive_meta=$18,
         body_source=$20,
+        daily_limit=GREATEST(COALESCE($21::INT, 0), 0),
         updated_at=NOW()
     WHERE id = $1 RETURNING id
 ),
@@ -499,11 +488,13 @@ INSERT INTO campaign_lists (campaign_id, list_id, list_name)
 UPDATE campaigns SET
     to_send=(CASE WHEN $2 != 0 THEN $2 ELSE to_send END),
     sent=sent+$3,
-    last_subscriber_id=(CASE WHEN $4 > 0 THEN $4 ELSE last_subscriber_id END),
     updated_at=NOW()
 WHERE id=$1;
 
 -- name: update-campaign-status
+WITH cleanup AS (
+    DELETE FROM campaign_pending_recipients WHERE campaign_id = $1 AND $2::campaign_status IN ('cancelled', 'finished')
+)
 UPDATE campaigns SET
     status=(
         CASE

@@ -25,6 +25,14 @@ import (
 	"golang.org/x/text/language"
 )
 
+// ErrDailyLimitReached is returned by Store.ClaimCampaignRecipient when a campaign has
+// used up its daily send limit for the current 24h window. The campaign stays
+// 'running' and is picked up again by the scanner once the window expires.
+var ErrDailyLimitReached = errors.New("daily send limit reached")
+
+// ErrCampaignInactive indicates the campaign was paused or cancelled before a send.
+var ErrCampaignInactive = errors.New("campaign is no longer running")
+
 // attribInlineEmbed is the HTML attrib used to mark <img> tags whose source
 // should be embedded as a multipart cid inline attachment.
 const attribInlineEmbed = "data-embed"
@@ -48,12 +56,13 @@ const (
 // that provides subscriber and campaign records.
 type Store interface {
 	NextCampaigns(currentIDs []int64, sentCounts []int64) ([]*models.Campaign, error)
-	NextSubscribers(campID, limit int) ([]models.Subscriber, error)
+	ClaimCampaignRecipient(campID, subID int) (bool, error)
+	NextSubscribers(campID, afterID, limit int) ([]models.Subscriber, error)
 	GetCampaign(campID int) (*models.Campaign, error)
 	GetAttachment(mediaID int) (models.Attachment, error)
 	GetInlineAttachmentByFilename(filename string) (models.Attachment, string, error)
 	UpdateCampaignStatus(campID int, status string) error
-	UpdateCampaignCounts(campID int, toSend int, sent int, lastSubID int) error
+	UpdateCampaignCounts(campID int, toSend int, sent int) error
 	CreateLink(url string) (string, error)
 	BlocklistSubscriber(id int64) error
 	DeleteSubscriber(id int64) error
@@ -295,11 +304,8 @@ func (m *Manager) Run() {
 	for p := range m.nextPipes {
 		has, err := p.NextSubscribers()
 		if err != nil {
-			m.log.Printf("error processing campaign batch (%s): %v", p.camp.Name, err)
-
-			// If the batch fails, stop the pipe and release it so that it doesn't hang forever.
-			// The cleanup() records the state in DB and scanCampaigns() picks it up at a later point.
 			p.Stop(false)
+			m.log.Printf("error fetching campaign batch (%s): %v", p.camp.Name, err)
 			p.wg.Done()
 			continue
 		}
@@ -316,15 +322,7 @@ func (m *Manager) Run() {
 				p.wg.Done()
 			}
 		} else {
-			// The pipe is created with a +1 on the waitgroup pseudo counter
-			// so that it immediately waits. Subsequently, every message created
-			// is incremented in the counter in pipe.newMessage(), and when it's'
-			// processed (or ignored when a campaign is paused or cancelled),
-			// the count is's reduced in worker().
-			//
-			// This marks down the original non-message +1, causing the waitgroup
-			// to be released and the pipe to end, triggering the pg.Wait()
-			// in newPipe() that calls pipe.cleanup().
+			// Release the producer. Cleanup runs after every queued worker is done.
 			p.wg.Done()
 		}
 	}
@@ -495,17 +493,18 @@ func (m *Manager) worker() {
 				return
 			}
 
-			// If the campaign has ended or stopped, ignore the message.
-			if msg.pipe != nil && msg.pipe.stopped.Load() {
-				// Reduce the message counter on the pipe.
-				msg.pipe.wg.Done()
-				continue
-			}
-
 			// Pause on hitting the message rate.
 			if numMsg >= m.cfg.MessageRate {
 				time.Sleep(time.Second)
 				numMsg = 0
+			}
+			if p := msg.pipe; p != nil {
+				var send bool
+				msg, send = p.prepareAttempt(msg.Subscriber)
+				if !send {
+					p.wg.Done()
+					continue
+				}
 			}
 			numMsg++
 
@@ -550,21 +549,16 @@ func (m *Manager) worker() {
 
 			// Increment the send rate or the error counter if there was an error.
 			if msg.pipe != nil {
-				// Mark the message as done.
-				msg.pipe.wg.Done()
-
 				if err != nil {
 					// Call the error callback, which keeps track of the error count
 					// and stops the campaign if the error count exceeds the threshold.
 					msg.pipe.OnError()
 				} else {
-					id := uint64(msg.Subscriber.ID)
-					if id > msg.pipe.lastID.Load() {
-						msg.pipe.lastID.Store(uint64(msg.Subscriber.ID))
-					}
 					msg.pipe.rate.Incr(1)
 					msg.pipe.sent.Add(1)
 				}
+				// Cleanup must see the outcome of the last queued message.
+				msg.pipe.wg.Done()
 			}
 
 		// Arbitrary message.
@@ -597,8 +591,7 @@ func (m *Manager) getCurrentCampaigns() ([]int64, []int64) {
 
 		// Get the sent counts for campaigns and reset them to 0
 		// as in the database, they're stored cumulatively (sent += $newSent).
-		counts = append(counts, p.sent.Load())
-		p.sent.Store(0)
+		counts = append(counts, p.sent.Swap(0))
 	}
 
 	return ids, counts

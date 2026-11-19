@@ -102,6 +102,17 @@
         </div>
       </b-table-column>
       <b-table-column v-slot="props" cell-class="lists" field="lists" :label="$t('globals.terms.lists')" width="15%">
+        <p class="is-size-7 has-text-grey mb-1" data-cy="recipient-estimate">
+          {{ $t('campaigns.recipientEstimate', { num: $utils.formatNumber(props.row.startedAt ? props.row.toSend : props.row.estRecipients) }) }}
+        </p>
+        <p v-if="props.row.dailyLimit > 0" class="is-size-7 has-text-grey mb-1">
+          {{ $t('campaigns.dailyLimitShort', { num: $utils.formatNumber(props.row.dailyLimit) }) }}
+          <template v-if="dailyResumeAt(props.row)">
+            &middot; <b-tag size="is-small">
+              {{ $t('campaigns.dailyLimitReached', { date: $utils.niceDate(dailyResumeAt(props.row), true) }) }}
+            </b-tag>
+          </template>
+        </p>
         <ul>
           <li v-for="l in props.row.lists" :key="l.id">
             <router-link :to="{ name: 'subscribers_list', params: { listID: l.id } }">
@@ -337,6 +348,15 @@ export default Vue.extend({
   },
 
   methods: {
+    dailyResumeAt(campaign) {
+      const c = this.getCampaignStats(campaign);
+      if (c.status !== 'running' || !c.dailyLimit || c.dailySent < c.dailyLimit || !c.dailyWindowStart) {
+        return null;
+      }
+      const resume = new Date(new Date(c.dailyWindowStart).getTime() + 24 * 60 * 60 * 1000);
+      return resume > new Date() ? resume : null;
+    },
+
     // Campaign statuses.
     canStart(c) {
       return c.status === 'draft' && !c.sendAt;
@@ -568,6 +588,7 @@ export default Vue.extend({
         from_email: c.fromEmail,
         content_type: c.contentType,
         messenger: c.messenger,
+        daily_limit: c.dailyLimit,
         tags: c.tags,
         template_id: c.templateId,
         body,

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+
 	"github.com/gofrs/uuid/v5"
 	"github.com/knadh/listmonk/internal/core"
 	"github.com/knadh/listmonk/internal/manager"
@@ -15,14 +17,6 @@ type store struct {
 	queries *models.Queries
 	core    *core.Core
 	media   media.Store
-}
-
-type runningCamp struct {
-	CampaignID       int    `db:"campaign_id"`
-	CampaignType     string `db:"campaign_type"`
-	LastSubscriberID int    `db:"last_subscriber_id"`
-	MaxSubscriberID  int    `db:"max_subscriber_id"`
-	ListID           int    `db:"list_id"`
 }
 
 func newManagerStore(q *models.Queries, c *core.Core, m media.Store) *store {
@@ -42,28 +36,31 @@ func (s *store) NextCampaigns(currentIDs []int64, sentCounts []int64) ([]*models
 	return out, err
 }
 
-// NextSubscribers retrieves a subset of subscribers of a given campaign.
-// Since batches are processed sequentially, the retrieval is ordered by ID,
-// and every batch takes the last ID of the last batch and fetches the next
-// batch above that.
-func (s *store) NextSubscribers(campID, limit int) ([]models.Subscriber, error) {
-	var camps []runningCamp
-	if err := s.queries.GetRunningCampaign.Select(&camps, campID); err != nil {
-		return nil, err
-	}
+// NextSubscribers pages through the frozen, pending audience without consuming it.
+func (s *store) NextSubscribers(campID, afterID, limit int) ([]models.Subscriber, error) {
+	var subs []models.Subscriber
+	err := s.queries.NextCampaignSubscribers.Select(&subs, campID, afterID, limit)
+	return subs, err
+}
 
-	var listIDs []int
-	for _, c := range camps {
-		listIDs = append(listIDs, c.ListID)
+// ClaimCampaignRecipient consumes just the recipient this worker is about to attempt.
+func (s *store) ClaimCampaignRecipient(campID, subID int) (bool, error) {
+	var action string
+	if err := s.queries.ClaimCampaignRecipient.Get(&action, campID, subID); err != nil {
+		return false, err
 	}
-
-	if len(listIDs) == 0 {
-		return nil, nil
+	switch action {
+	case "attempt":
+		return true, nil
+	case "limited":
+		return false, manager.ErrDailyLimitReached
+	case "inactive":
+		return false, manager.ErrCampaignInactive
+	case "skip":
+		return false, nil
+	default:
+		return false, fmt.Errorf("unexpected campaign claim result %q", action)
 	}
-
-	var out []models.Subscriber
-	err := s.queries.NextCampaignSubscribers.Select(&out, camps[0].CampaignID, camps[0].CampaignType, camps[0].LastSubscriberID, camps[0].MaxSubscriberID, pq.Array(listIDs), limit)
-	return out, err
 }
 
 // GetCampaign fetches a campaign from the database.
@@ -80,8 +77,8 @@ func (s *store) UpdateCampaignStatus(campID int, status string) error {
 }
 
 // UpdateCampaignCounts updates a campaign's status.
-func (s *store) UpdateCampaignCounts(campID int, toSend int, sent int, lastSubID int) error {
-	_, err := s.queries.UpdateCampaignCounts.Exec(campID, toSend, sent, lastSubID)
+func (s *store) UpdateCampaignCounts(campID int, toSend int, sent int) error {
+	_, err := s.queries.UpdateCampaignCounts.Exec(campID, toSend, sent)
 	return err
 }
 
