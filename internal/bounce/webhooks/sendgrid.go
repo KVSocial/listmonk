@@ -16,6 +16,10 @@ import (
 	"github.com/knadh/listmonk/models"
 )
 
+// sendgridSpamReportDropReason is the dropped event reason for recipients
+// that SendGrid suppressed after a spam report.
+const sendgridSpamReportDropReason = "Spam Reporting Address"
+
 type sendgridNotif struct {
 	Email                string `json:"email"`
 	Timestamp            int64  `json:"timestamp"`
@@ -76,17 +80,27 @@ func (s *Sendgrid) ProcessEvents(sig, timestamp string, b []byte) ([]models.Camp
 			models.DeliveryEventDeferred,
 			models.DeliveryEventDelivered,
 			models.DeliveryEventBounce,
-			models.DeliveryEventDropped:
+			models.DeliveryEventDropped,
+			models.DeliveryEventSpamReport:
 		default:
 			unsupported++
 			continue
 		}
 
 		bounceType := ""
-		if eventType == models.DeliveryEventBounce {
+		switch eventType {
+		case models.DeliveryEventBounce:
 			bounceType = models.BounceTypeHard
 			if n.BounceClassification == "technical" || n.BounceClassification == "content" {
 				bounceType = models.BounceTypeSoft
+			}
+		case models.DeliveryEventSpamReport:
+			bounceType = models.BounceTypeComplaint
+		case models.DeliveryEventDropped:
+			// SendGrid drops mail to addresses it has suppressed for an
+			// earlier spam report, which may predate spamreport handling.
+			if n.Reason == sendgridSpamReportDropReason {
+				bounceType = models.BounceTypeComplaint
 			}
 		}
 

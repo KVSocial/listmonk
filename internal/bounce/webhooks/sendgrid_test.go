@@ -57,7 +57,8 @@ func TestSendGridProcessEvents(t *testing.T) {
 		{"email":"user@example.com","timestamp":1787040003,"event":"delivered","sg_event_id":"event-3","sg_message_id":"message-1","status":"250","XListmonkCampaign":"` + campaignUUID + `","XListmonkSubscriber":"` + subscriberUUID + `"},
 		{"email":"user@example.com","timestamp":1787040004,"event":"bounce","sg_event_id":"event-4","sg_message_id":"message-2","bounce_classification":"technical","reason":"mailbox unavailable","XListmonkCampaign":"` + campaignUUID + `","XListmonkSubscriber":"` + subscriberUUID + `"},
 		{"email":"user@example.com","timestamp":1787040005,"event":"dropped","sg_event_id":"event-5","sg_message_id":"message-3","reason":"suppressed","XListmonkCampaign":"` + campaignUUID + `","XListmonkSubscriber":"` + subscriberUUID + `"},
-		{"email":"user@example.com","timestamp":1787040006,"event":"open","sg_event_id":"event-6","sg_message_id":"message-1","XListmonkCampaign":"` + campaignUUID + `"}
+		{"email":"user@example.com","timestamp":1787040006,"event":"open","sg_event_id":"event-6","sg_message_id":"message-1","XListmonkCampaign":"` + campaignUUID + `"},
+		{"email":"user@example.com","timestamp":1787040007,"event":"spamreport","sg_event_id":"event-7","sg_message_id":"message-1","XListmonkCampaign":"` + campaignUUID + `","XListmonkSubscriber":"` + subscriberUUID + `"}
 	]`)
 
 	sg, signature, timestamp := newSignedSendGrid(t, payload)
@@ -65,8 +66,8 @@ func TestSendGridProcessEvents(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ProcessEvents() error = %v", err)
 	}
-	if len(events) != 5 {
-		t.Fatalf("ProcessEvents() returned %d events, want 5", len(events))
+	if len(events) != 6 {
+		t.Fatalf("ProcessEvents() returned %d events, want 6", len(events))
 	}
 	if unsupported != 1 {
 		t.Fatalf("ProcessEvents() reported %d unsupported events, want 1", unsupported)
@@ -78,6 +79,7 @@ func TestSendGridProcessEvents(t *testing.T) {
 		models.DeliveryEventDelivered,
 		models.DeliveryEventBounce,
 		models.DeliveryEventDropped,
+		models.DeliveryEventSpamReport,
 	}
 	for i, event := range events {
 		if event.EventType != wantTypes[i] {
@@ -95,6 +97,36 @@ func TestSendGridProcessEvents(t *testing.T) {
 	}
 	if events[3].BounceType != models.BounceTypeSoft {
 		t.Errorf("technical bounce type = %q, want soft", events[3].BounceType)
+	}
+	if events[5].BounceType != models.BounceTypeComplaint {
+		t.Errorf("spam report bounce type = %q, want complaint", events[5].BounceType)
+	}
+	for _, i := range []int{0, 1, 2, 4} {
+		if events[i].BounceType != "" {
+			t.Errorf("event %d bounce type = %q, want empty", i, events[i].BounceType)
+		}
+	}
+}
+
+func TestSendGridProcessEventsSpamReportingAddressDrop(t *testing.T) {
+	payload := []byte(`[
+		{"email":"user@example.com","timestamp":1787040001,"event":"dropped","sg_event_id":"event-1","reason":"Spam Reporting Address"},
+		{"email":"user@example.com","timestamp":1787040002,"event":"dropped","sg_event_id":"event-2","reason":"Bounced Address"}
+	]`)
+	sg, signature, timestamp := newSignedSendGrid(t, payload)
+
+	events, _, err := sg.ProcessEvents(signature, timestamp, payload)
+	if err != nil {
+		t.Fatalf("ProcessEvents() error = %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("ProcessEvents() returned %d events, want 2", len(events))
+	}
+	if events[0].EventType != models.DeliveryEventDropped || events[0].BounceType != models.BounceTypeComplaint {
+		t.Errorf("spam reporting drop = %q/%q, want dropped/complaint", events[0].EventType, events[0].BounceType)
+	}
+	if events[1].BounceType != "" {
+		t.Errorf("bounced address drop bounce type = %q, want empty", events[1].BounceType)
 	}
 }
 

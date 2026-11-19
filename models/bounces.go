@@ -10,11 +10,12 @@ const (
 	BounceTypeSoft      = "soft"
 	BounceTypeComplaint = "complaint"
 
-	DeliveryEventProcessed = "processed"
-	DeliveryEventDeferred  = "deferred"
-	DeliveryEventDelivered = "delivered"
-	DeliveryEventBounce    = "bounce"
-	DeliveryEventDropped   = "dropped"
+	DeliveryEventProcessed  = "processed"
+	DeliveryEventDeferred   = "deferred"
+	DeliveryEventDelivered  = "delivered"
+	DeliveryEventBounce     = "bounce"
+	DeliveryEventDropped    = "dropped"
+	DeliveryEventSpamReport = "spamreport"
 )
 
 // CampaignDeliveryEvent represents a provider delivery lifecycle event with
