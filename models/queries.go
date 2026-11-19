@@ -88,7 +88,7 @@ type Queries struct {
 	ExportCampaignLinkClicks     *sqlx.Stmt `query:"export-campaign-link-clicks"`
 
 	NextCampaigns            *sqlx.Stmt `query:"next-campaigns"`
-	GetRunningCampaign       *sqlx.Stmt `query:"get-running-campaign"`
+	ClaimCampaignRecipient   *sqlx.Stmt `query:"claim-campaign-recipient"`
 	NextCampaignSubscribers  *sqlx.Stmt `query:"next-campaign-subscribers"`
 	GetRecipientEstimate     *sqlx.Stmt `query:"get-recipient-estimate"`
 	GetOneCampaignSubscriber *sqlx.Stmt `query:"get-one-campaign-subscriber"`

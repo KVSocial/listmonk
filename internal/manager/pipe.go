@@ -1,6 +1,7 @@
 package manager
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -15,7 +16,7 @@ type pipe struct {
 	rate             *ratecounter.RateCounter
 	wg               *sync.WaitGroup
 	sent             atomic.Int64
-	lastID           atomic.Uint64
+	afterID          int // Producer-only cursor for this pipe.
 	errors           atomic.Uint64
 	stopped          atomic.Bool
 	withErrors       atomic.Bool
@@ -81,7 +82,10 @@ func (m *Manager) newPipe(c *models.Campaign) (*pipe, error) {
 // have been processed, or that a campaign has been paused or cancelled.
 func (p *pipe) NextSubscribers() (bool, error) {
 	// Fetch the next batch of subscribers from a 'running' campaign.
-	subs, err := p.m.store.NextSubscribers(p.camp.ID, p.m.cfg.BatchSize)
+	if p.stopped.Load() || p.waitingForWindow.Load() {
+		return false, nil
+	}
+	subs, err := p.m.store.NextSubscribers(p.camp.ID, p.afterID, p.m.cfg.BatchSize)
 	if err != nil {
 		return false, fmt.Errorf("error fetching campaign subscribers (%s): %w", p.camp.Name, err)
 	}
@@ -99,15 +103,12 @@ func (p *pipe) NextSubscribers() (bool, error) {
 
 	// Push messages.
 	for _, s := range subs {
-		msg, err := p.newMessage(s)
-		if err != nil {
-			p.m.log.Printf("error rendering message (%s) (%s): %v", p.camp.Name, s.Email, err)
-			continue
+		if p.stopped.Load() || p.waitingForWindow.Load() {
+			return false, nil
 		}
-
-		// Push the message to the queue while blocking and waiting until
-		// the queue is drained.
-		p.m.campMsgQ <- msg
+		p.wg.Add(1)
+		p.m.campMsgQ <- CampaignMessage{Campaign: p.camp, Subscriber: s, pipe: p}
+		p.afterID = s.ID
 
 		// Check if the sliding window is active.
 		if hasSliding {
@@ -172,19 +173,34 @@ func (p *pipe) Stop(withErrors bool) {
 	p.stopped.Store(true)
 }
 
-// newMessage returns a campaign message while internally incrementing the
-// number of messages in the pipe wait group so that the status of every
-// message can be atomically tracked.
-func (p *pipe) newMessage(s models.Subscriber) (CampaignMessage, error) {
+// prepareAttempt consumes durable work only when a worker is ready. Messages left
+// in memory on pause have no database side effects and will be fetched on resume.
+func (p *pipe) prepareAttempt(s models.Subscriber) (CampaignMessage, bool) {
+	if p.stopped.Load() || p.waitingForWindow.Load() {
+		return CampaignMessage{}, false
+	}
+	claimed, err := p.m.store.ClaimCampaignRecipient(p.camp.ID, s.ID)
+	if errors.Is(err, ErrDailyLimitReached) {
+		p.waitingForWindow.Store(true)
+		return CampaignMessage{}, false
+	}
+	if err != nil {
+		p.Stop(false)
+		if !errors.Is(err, ErrCampaignInactive) {
+			p.m.log.Printf("error claiming recipient %d for campaign %d: %v", s.ID, p.camp.ID, err)
+		}
+		return CampaignMessage{}, false
+	}
+	if !claimed {
+		return CampaignMessage{}, false
+	}
 	msg, err := p.m.NewCampaignMessage(p.camp, s)
 	if err != nil {
-		return msg, err
+		p.m.log.Printf("error rendering message (%s) (%s): %v", p.camp.Name, s.Email, err)
+		return CampaignMessage{}, false
 	}
-
 	msg.pipe = p
-	p.wg.Add(1)
-
-	return msg, nil
+	return msg, true
 }
 
 // cleanup finishes the campaign and updates the campaign status in the DB
@@ -198,12 +214,7 @@ func (p *pipe) cleanup() {
 	}()
 
 	// Update campaign's 'sent count.
-	lastID := int(p.lastID.Load())
-	if p.waitingForWindow.Load() && !p.stopped.Load() {
-		// All reservations drained. Keep the database cursor, including skipped/failed messages.
-		lastID = 0
-	}
-	if err := p.m.store.UpdateCampaignCounts(p.camp.ID, 0, int(p.sent.Swap(0)), lastID); err != nil {
+	if err := p.m.store.UpdateCampaignCounts(p.camp.ID, 0, int(p.sent.Swap(0))); err != nil {
 		p.m.log.Printf("error updating campaign counts (%s): %v", p.camp.Name, err)
 	}
 

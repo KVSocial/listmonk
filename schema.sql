@@ -124,6 +124,7 @@ CREATE TABLE campaigns (
 
     -- Optional per-campaign daily send cap (0 = unlimited). daily_sent counts
     -- messages queued in the current 24h window that began at daily_window_start.
+    audience_frozen    BOOLEAN NOT NULL DEFAULT false,
     daily_limit        INT NOT NULL DEFAULT 0,
     daily_sent         INT NOT NULL DEFAULT 0,
     daily_window_start TIMESTAMP WITH TIME ZONE NULL,
@@ -157,6 +158,27 @@ CREATE TABLE campaign_lists (
 CREATE UNIQUE INDEX ON campaign_lists (campaign_id, list_id);
 DROP INDEX IF EXISTS idx_camp_lists_camp_id; CREATE INDEX idx_camp_lists_camp_id ON campaign_lists(campaign_id);
 DROP INDEX IF EXISTS idx_camp_lists_list_id; CREATE INDEX idx_camp_lists_list_id ON campaign_lists(list_id);
+
+DROP TABLE IF EXISTS campaign_pending_recipients;
+CREATE TABLE IF NOT EXISTS campaign_pending_recipients (
+    campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+    subscriber_id INTEGER NOT NULL REFERENCES subscribers(id) ON DELETE CASCADE,
+    PRIMARY KEY (campaign_id, subscriber_id)
+);
+CREATE INDEX IF NOT EXISTS idx_campaign_pending_subscriber ON campaign_pending_recipients(subscriber_id);
+
+-- Shared eligibility rules for the initial snapshot and the final delivery check.
+CREATE OR REPLACE VIEW campaign_eligible_subscribers AS
+    SELECT cl.campaign_id, sl.subscriber_id
+    FROM campaign_lists cl
+    JOIN campaigns c ON c.id = cl.campaign_id
+    JOIN lists l ON l.id = cl.list_id
+    JOIN subscriber_lists sl ON sl.list_id = l.id
+    JOIN subscribers s ON s.id = sl.subscriber_id
+    WHERE s.status != 'blocklisted' AND CASE
+        WHEN c.type = 'optin' THEN l.optin = 'double' AND sl.status = 'unconfirmed'
+        WHEN l.optin = 'double' THEN sl.status = 'confirmed'
+        ELSE sl.status != 'unsubscribed' END;
 
 DROP TABLE IF EXISTS campaign_views CASCADE;
 CREATE TABLE campaign_views (
@@ -464,9 +486,12 @@ DROP INDEX IF EXISTS mat_dashboard_charts_idx; CREATE UNIQUE INDEX mat_dashboard
 -- subscriber counts stats for lists
 DROP MATERIALIZED VIEW IF EXISTS mat_list_subscriber_stats;
 CREATE MATERIALIZED VIEW mat_list_subscriber_stats AS
-    SELECT NOW() AS updated_at, lists.id AS list_id, subscriber_lists.status, COUNT(subscriber_lists.status) AS subscriber_count FROM lists
-    LEFT JOIN subscriber_lists ON (subscriber_lists.list_id = lists.id)
-    GROUP BY lists.id, subscriber_lists.status
+    SELECT NOW() AS updated_at, l.id AS list_id, sl.status, COUNT(sl.status) AS subscriber_count,
+           COUNT(sl.status) FILTER (WHERE s.status != 'blocklisted') AS sendable_count
+    FROM lists l
+    LEFT JOIN subscriber_lists sl ON sl.list_id = l.id
+    LEFT JOIN subscribers s ON s.id = sl.subscriber_id
+    GROUP BY l.id, sl.status
     UNION ALL
-    SELECT NOW() AS updated_at, 0 AS list_id, NULL AS status, COUNT(id) AS subscriber_count FROM subscribers;
-DROP INDEX IF EXISTS mat_list_subscriber_stats_idx; CREATE UNIQUE INDEX mat_list_subscriber_stats_idx ON mat_list_subscriber_stats (list_id, status);
+    SELECT NOW(), 0, NULL, COUNT(*), COUNT(*) FILTER (WHERE status != 'blocklisted') FROM subscribers;
+CREATE UNIQUE INDEX mat_list_subscriber_stats_idx ON mat_list_subscriber_stats (list_id, status);

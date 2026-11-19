@@ -1,6 +1,8 @@
 package main
 
 import (
+	"fmt"
+
 	"github.com/gofrs/uuid/v5"
 	"github.com/knadh/listmonk/internal/core"
 	"github.com/knadh/listmonk/internal/manager"
@@ -34,16 +36,31 @@ func (s *store) NextCampaigns(currentIDs []int64, sentCounts []int64) ([]*models
 	return out, err
 }
 
-// NextSubscribers retrieves a subset of subscribers of a given campaign.
-// Since batches are processed sequentially, the retrieval is ordered by ID,
-// and every batch takes the last ID of the last batch and fetches the next
-// batch above that.
-func (s *store) NextSubscribers(campID, limit int) ([]models.Subscriber, error) {
-	subs, atLimit, err := s.core.ReserveCampaignSubscribers(campID, limit)
-	if atLimit {
-		return nil, manager.ErrDailyLimitReached
-	}
+// NextSubscribers pages through the frozen, pending audience without consuming it.
+func (s *store) NextSubscribers(campID, afterID, limit int) ([]models.Subscriber, error) {
+	var subs []models.Subscriber
+	err := s.queries.NextCampaignSubscribers.Select(&subs, campID, afterID, limit)
 	return subs, err
+}
+
+// ClaimCampaignRecipient consumes just the recipient this worker is about to attempt.
+func (s *store) ClaimCampaignRecipient(campID, subID int) (bool, error) {
+	var action string
+	if err := s.queries.ClaimCampaignRecipient.Get(&action, campID, subID); err != nil {
+		return false, err
+	}
+	switch action {
+	case "attempt":
+		return true, nil
+	case "limited":
+		return false, manager.ErrDailyLimitReached
+	case "inactive":
+		return false, manager.ErrCampaignInactive
+	case "skip":
+		return false, nil
+	default:
+		return false, fmt.Errorf("unexpected campaign claim result %q", action)
+	}
 }
 
 // GetCampaign fetches a campaign from the database.
@@ -60,8 +77,8 @@ func (s *store) UpdateCampaignStatus(campID int, status string) error {
 }
 
 // UpdateCampaignCounts updates a campaign's status.
-func (s *store) UpdateCampaignCounts(campID int, toSend int, sent int, lastSubID int) error {
-	_, err := s.queries.UpdateCampaignCounts.Exec(campID, toSend, sent, lastSubID)
+func (s *store) UpdateCampaignCounts(campID int, toSend int, sent int) error {
+	_, err := s.queries.UpdateCampaignCounts.Exec(campID, toSend, sent)
 	return err
 }
 

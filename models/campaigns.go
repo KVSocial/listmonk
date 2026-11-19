@@ -61,7 +61,8 @@ type Campaign struct {
 	ArchiveMeta       json.RawMessage `db:"archive_meta" json:"archive_meta"`
 
 	// Optional daily send cap (0 = unlimited). DailySent is the number of
-	// messages queued in the current 24h window that began at DailyWindowStart.
+	// recipient attempts in the current 24h window that began at DailyWindowStart.
+	AudienceFrozen   bool      `db:"audience_frozen" json:"-"`
 	DailyLimit       int       `db:"daily_limit" json:"daily_limit"`
 	DailySent        int       `db:"daily_sent" json:"daily_sent"`
 	DailyWindowStart null.Time `db:"daily_window_start" json:"daily_window_start"`

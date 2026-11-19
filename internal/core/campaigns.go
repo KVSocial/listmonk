@@ -21,51 +21,6 @@ const (
 	campaignTplArchive = "archive"
 )
 
-// ReserveCampaignSubscribers advances the subscriber checkpoint and charges the batch
-// to the same 24-hour window in one transaction. atLimit means more recipients remain.
-func (c *Core) ReserveCampaignSubscribers(campID, limit int) (subs []models.Subscriber, atLimit bool, err error) {
-	tx, err := c.db.Beginx()
-	if err != nil {
-		return nil, false, err
-	}
-	defer tx.Rollback()
-
-	var campaign struct {
-		Type        string        `db:"type"`
-		LastID      int           `db:"last_subscriber_id"`
-		MaxID       int           `db:"max_subscriber_id"`
-		ListIDs     pq.Int64Array `db:"list_ids"`
-		DailyLimit  int           `db:"daily_limit"`
-		DailySent   int           `db:"daily_sent"`
-		WindowStart time.Time     `db:"window_start"`
-	}
-	err = tx.Stmtx(c.q.GetRunningCampaign).Get(&campaign, campID)
-	if err == sql.ErrNoRows {
-		return nil, false, nil
-	}
-	if err != nil {
-		return nil, false, err
-	}
-	if campaign.LastID >= campaign.MaxID || len(campaign.ListIDs) == 0 {
-		return nil, false, nil
-	}
-	if campaign.DailyLimit > 0 {
-		limit = min(limit, campaign.DailyLimit-campaign.DailySent)
-		if limit <= 0 {
-			return nil, true, nil
-		}
-	}
-
-	if err := tx.Stmtx(c.q.NextCampaignSubscribers).Select(&subs, campID, campaign.Type,
-		campaign.LastID, campaign.MaxID, campaign.ListIDs, limit, campaign.DailySent, campaign.WindowStart); err != nil {
-		return nil, false, err
-	}
-	if err := tx.Commit(); err != nil {
-		return nil, false, err
-	}
-	return subs, false, nil
-}
-
 // QueryCampaigns retrieves paginated campaigns optionally filtering them by the given arbitrary
 // query expression. It also returns the total number of records in the DB.
 func (c *Core) QueryCampaigns(searchStr string, statuses, tags []string, orderBy, order string, getAll bool, permittedLists []int, offset, limit int) (models.Campaigns, int, error) {

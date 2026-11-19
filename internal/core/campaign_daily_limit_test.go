@@ -1,15 +1,18 @@
 package core
 
 import (
+	"fmt"
 	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/jmoiron/sqlx"
-	"github.com/knadh/listmonk/models"
 	"github.com/lib/pq"
 )
 
-func TestCampaignDailyReservations(t *testing.T) {
+// Exercise the shipping schema, including the snapshot, eligibility view and cached estimates.
+func TestCampaignAudienceAndClaims(t *testing.T) {
 	dsn := os.Getenv("LISTMONK_TEST_DB_DSN")
 	if dsn == "" {
 		t.Skip("LISTMONK_TEST_DB_DSN is not set")
@@ -19,76 +22,112 @@ func TestCampaignDailyReservations(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer db.Close()
-	db.SetMaxOpenConns(1)
-	db.MustExec(`
-		CREATE TEMP TABLE campaigns (id int, type text, status text, last_subscriber_id int, max_subscriber_id int,
-			daily_limit int, daily_sent int, daily_window_start timestamptz, updated_at timestamptz);
-		CREATE TEMP TABLE lists (id int, optin text);
-		CREATE TEMP TABLE campaign_lists (campaign_id int, list_id int);
-		CREATE TEMP TABLE subscribers (id int, status text);
-		CREATE TEMP TABLE subscriber_lists (subscriber_id int, list_id int, status text);
-		INSERT INTO campaigns VALUES (1,'optin','running',0,4,2,0,NULL,NULL);
-		INSERT INTO lists VALUES (1,'double'),(2,'single');
-		INSERT INTO campaign_lists VALUES (1,1);
-		INSERT INTO subscribers SELECT n,'enabled' FROM generate_series(1,4) n;
-		INSERT INTO subscriber_lists SELECT id,1,'unconfirmed' FROM subscribers;
-		INSERT INTO subscriber_lists VALUES (1,2,'confirmed');
-		CREATE TEMP VIEW mat_list_subscriber_stats AS
-			SELECT list_id,status,COUNT(*) AS subscriber_count FROM subscriber_lists GROUP BY list_id,status;
-		CREATE TYPE pg_temp.campaign_type AS ENUM ('optin','regular');
-		SET search_path TO pg_temp;
+	tx := db.MustBegin()
+	defer tx.Rollback()
+	schema := fmt.Sprintf("campaign_audience_test_%d", time.Now().UnixNano())
+	tx.MustExec("CREATE SCHEMA " + schema)
+	tx.MustExec("SET LOCAL search_path TO " + schema)
+	ddl, err := os.ReadFile(filepath.Join("..", "..", "schema.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tx.MustExec(string(ddl))
+	tx.MustExec(`
+		INSERT INTO lists (uuid,name,type,optin) VALUES (gen_random_uuid(),'Opt-in','private','double'),(gen_random_uuid(),'Regular','private','single');
+		INSERT INTO subscribers (uuid,email,name) SELECT gen_random_uuid(), i||'@example.invalid','Test' FROM generate_series(1,6) i;
+		UPDATE subscribers SET status='blocklisted' WHERE id=5;
+		INSERT INTO subscriber_lists (subscriber_id,list_id,status) SELECT id,1,'unconfirmed' FROM subscribers WHERE id>1;
+		INSERT INTO subscriber_lists (subscriber_id,list_id,status) VALUES (2,2,'confirmed');
+		INSERT INTO campaigns (uuid,name,subject,from_email,body,messenger,status,type,daily_limit)
+		  VALUES (gen_random_uuid(),'Test','Test','test@example.invalid','Body','email','running','optin',2);
+		INSERT INTO campaign_lists(campaign_id,list_id) VALUES(1,1),(1,2);
+		REFRESH MATERIALIZED VIEW mat_list_subscriber_stats;
 	`)
-	prepare := func(name string) *sqlx.Stmt {
+	estimate := loadNamedTestQuery(t, "campaigns.sql", "get-recipient-estimate")
+	for _, tc := range []struct {
+		typ       string
+		all       bool
+		permitted []int
+		want      int
+	}{
+		{"optin", true, nil, 4}, {"regular", true, nil, 1}, {"optin", false, []int{2}, 0}, {"regular", false, []int{2}, 1},
+	} {
+		var got int
+		if err := tx.Get(&got, estimate, pq.Array([]int{1, 2}), tc.typ, tc.all, pq.Array(tc.permitted)); err != nil || got != tc.want {
+			t.Fatalf("estimate %+v: %d, %v", tc, got, err)
+		}
+	}
+	scan := func() {
 		t.Helper()
-		stmt, err := db.Preparex(loadNamedTestQuery(t, "campaigns.sql", name))
-		if err != nil {
+		if _, err := tx.Exec(loadNamedTestQuery(t, "campaigns.sql", "next-campaigns"), pq.Array([]int{}), pq.Array([]int{})); err != nil {
 			t.Fatal(err)
 		}
-		return stmt
 	}
-	c := &Core{db: db, q: &models.Queries{
-		GetRunningCampaign: prepare("get-running-campaign"), NextCampaignSubscribers: prepare("next-campaign-subscribers"),
-	}}
-	estimate := prepare("get-recipient-estimate")
-	for _, tc := range []struct {
-		typ     string
-		all     bool
-		allowed []int
-		want    int
-	}{
-		{"optin", true, nil, 4}, {"regular", true, nil, 1},
-		{"optin", false, []int{2}, 0}, {"regular", false, []int{2}, 1},
-	} {
-		var count int
-		err := estimate.Get(&count, pq.Array([]int{1, 2}), tc.typ, tc.all, pq.Array(tc.allowed))
-		if err != nil || count != tc.want {
-			t.Fatalf("estimate %+v: count=%d err=%v", tc, count, err)
-		}
-	}
-
-	// A rejected usage update must leave the cursor at the start of the batch.
-	db.MustExec("ALTER TABLE campaigns ADD CONSTRAINT reject_charge CHECK (daily_sent < 2)")
-	if subs, _, err := c.ReserveCampaignSubscribers(1, 10); err == nil || len(subs) != 0 {
-		t.Fatalf("unexpected reservation on failed write: %v, %v", subs, err)
-	}
-	db.MustExec("ALTER TABLE campaigns DROP CONSTRAINT reject_charge")
-	check := func(wantLimited bool, ids ...int) {
+	checkIDs := func(want string) {
 		t.Helper()
-		subs, limited, err := c.ReserveCampaignSubscribers(1, 10)
-		if err != nil || limited != wantLimited || len(subs) != len(ids) {
-			t.Fatalf("reserve: subs=%v limited=%v err=%v", subs, limited, err)
+		var ids []int
+		if err := tx.Select(&ids, "SELECT subscriber_id FROM campaign_pending_recipients ORDER BY subscriber_id"); err != nil {
+			t.Fatal(err)
 		}
-		for i, sub := range subs {
-			if sub.ID != ids[i] {
-				t.Fatalf("subscriber %d: got %d, want %d", i, sub.ID, ids[i])
-			}
+		if fmt.Sprint(ids) != want {
+			t.Fatalf("pending recipients %v, want %s", ids, want)
 		}
 	}
-	check(false, 1, 2)
-	check(true)
-	db.MustExec("UPDATE campaigns SET daily_window_start = NOW() - INTERVAL '24 hours'")
-	check(false, 3, 4)
-	check(false) // Exactly exhausted on the last batch.
-	db.MustExec("UPDATE campaigns SET last_subscriber_id=0, daily_limit=0")
-	check(false, 1, 2, 3, 4)
+	claimSQL := loadNamedTestQuery(t, "campaigns.sql", "claim-campaign-recipient")
+	claim := func(id int, want string) {
+		t.Helper()
+		var got string
+		if err := tx.Get(&got, claimSQL, 1, id); err != nil || got != want {
+			t.Fatalf("claim %d: got %q, want %q, err %v", id, got, want, err)
+		}
+	}
+	scan()
+	checkIDs("[2 3 4 6]")
+	tx.MustExec("INSERT INTO subscriber_lists(subscriber_id,list_id,status) VALUES (1,1,'unconfirmed')")
+	tx.MustExec("UPDATE subscribers SET status='blocklisted' WHERE id=6")
+	// A rejected usage update must roll back the recipient claim too.
+	tx.MustExec("ALTER TABLE campaigns ADD CONSTRAINT reject_charge CHECK (daily_sent=0); SAVEPOINT before_claim")
+	var result string
+	if err := tx.Get(&result, claimSQL, 1, 2); err == nil {
+		t.Fatal("expected the quota update to fail")
+	}
+	tx.MustExec("ROLLBACK TO before_claim; ALTER TABLE campaigns DROP CONSTRAINT reject_charge")
+	claim(2, "attempt")
+	claim(2, "skip")
+	tx.MustExec("UPDATE campaigns SET status='paused' WHERE id=1")
+	claim(3, "inactive")
+	checkIDs("[3 4 6]")
+	tx.MustExec("UPDATE campaigns SET status='running' WHERE id=1")
+	scan()
+	checkIDs("[3 4 6]")
+	claim(3, "attempt")
+	claim(4, "limited")
+	claim(6, "skip")
+	tx.MustExec("UPDATE campaigns SET daily_window_start=NOW()-INTERVAL '24 hours'")
+	claim(4, "attempt")
+	checkIDs("[]")
+	var total int
+	if err := tx.Get(&total, "SELECT to_send FROM campaigns WHERE id=1"); err != nil || total != 4 {
+		t.Fatalf("initial audience: %d, %v", total, err)
+	}
+	// On upgrade an in-flight campaign has a legacy cursor, not an initial member list.
+	// Only materialize the still-eligible, unprocessed IDs inside its recorded bounds.
+	tx.MustExec(`
+		UPDATE campaigns SET status='finished' WHERE id=1;
+		INSERT INTO campaigns (id,uuid,name,subject,from_email,body,messenger,type,status,started_at,
+			last_subscriber_id,max_subscriber_id,to_send)
+		VALUES (2,gen_random_uuid(),'Legacy','Test','test@example.invalid','Body','email','optin','running',NOW(),2,3,5);
+		INSERT INTO campaign_lists(campaign_id,list_id) VALUES(2,1);
+	`)
+	scan()
+	checkIDs("[3]")
+	var action string
+	if err := tx.Get(&action, claimSQL, 2, 3); err != nil || action != "attempt" {
+		t.Fatalf("unlimited legacy campaign: %s, %v", action, err)
+	}
+	if err := tx.Get(&total, "SELECT to_send FROM campaigns WHERE id=2"); err != nil || total != 5 {
+		t.Fatalf("legacy total: %d, %v", total, err)
+	}
+	checkIDs("[]")
+
 }
